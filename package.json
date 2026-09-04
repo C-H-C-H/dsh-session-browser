@@ -1,0 +1,38 @@
+{
+  "name": "dsh-session-browser",
+  "version": "1.0.0",
+  "description": "DSH Desktop plugin for browsing sessions with round-level navigation and message jumping",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./client": "./lib/client.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-invariants": "^0.1.2-alpha.1",
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-desktop",
+    "plugin",
+    "session-browser"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/dsh-session-browser.git"
+  }
+}
