@@ -174,8 +174,46 @@ function browseIcon(): ReturnType<typeof createElement> {
 
 const { useState: _useState, useEffect: _useEffect, useRef: _useRef } = React
 
-function jumpToMessage(ctx: Context, sessionId: string, eventId: number | string): void {
-  ctx.sessions.open(sessionId)
+// Canonical source: src/jump-loader.mjs (plain-JS twin for node tests;
+// inlined here because the ModuleLoader client bundle has no relative imports).
+function jumpWithTimeout(promise: Promise<unknown>, ms: number): Promise<unknown> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('jump loader timeout')), ms)
+  })
+  return Promise.race([promise, timeout]).then(
+    (value) => { clearTimeout(timer); return value },
+    (err) => { clearTimeout(timer); throw err }
+  )
+}
+
+async function ensureWindowCovers(sessions: any, sessionId: string, seq: number, timeoutMs = 15000): Promise<boolean> {
+  if (!sessions || typeof sessions.scope !== 'function') return false
+  const deadline = Date.now() + timeoutMs
+  for (let attempt = 1; ; attempt++) {
+    let face: any
+    try {
+      const scoped = sessions.scope(sessionId)
+      face = scoped && typeof sessions.sessionOf === 'function' ? sessions.sessionOf(scoped) : undefined
+    } catch { face = undefined }
+    if (face && typeof face.loadThrough === 'function') {
+      try {
+        await jumpWithTimeout(face.loadThrough(seq), Math.max(1, deadline - Date.now()))
+        return true
+      } catch { return false }
+    }
+    if (attempt >= 4 || Date.now() >= deadline) return false
+    try { await new Promise((resolve) => setTimeout(resolve, 300)) } catch { return false }
+  }
+}
+
+async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string): Promise<void> {
+  try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+  // Phase 1: page the virtualized event window backwards until it covers the
+  // target seq, so the anchor element actually renders. No-op fallback on
+  // hosts without SessionFace.loadThrough (e.g. desktop 2.0.4).
+  try { await ensureWindowCovers((ctx as any).sessions, sessionId, eventSeq, 15000) } catch { /* ignore */ }
+  // Phase 2: anchor scroll (unchanged behavior).
   const anchorKey = `13:input-message${eventId}`
   let attempts = 0
   const tryScroll = () => {
@@ -316,7 +354,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       createElement('div', {
                         key: r.seq,
                         className: 'ssb_roundItem',
-                        onClick: () => jumpToMessage(ctx, selected.sessionId, r.eventId),
+                        onClick: () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId),
                       },
                         createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
                         createElement('div', { className: 'ssb_roundMeta' }, fmtTime(r.time))
