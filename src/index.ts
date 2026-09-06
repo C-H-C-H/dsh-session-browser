@@ -68,13 +68,49 @@ function shortPath(cwd: string): string {
   return last.length > 26 ? last.slice(0, 24) + '…' : last
 }
 
+// Canonical source: src/persistence-compat.mjs
+function normalizeHeaders(entries: any): any[] {
+  if (!Array.isArray(entries)) return []
+  const out: any[] = []
+  for (const e of entries) {
+    const h = e && typeof e === 'object' && e.header ? e.header : e
+    if (h && typeof h.id === 'string') out.push(h)
+  }
+  return out
+}
+
+const READ_CHUNK = 500
+
+async function readStoredEvents(persistence: any, sessionId: string): Promise<any[] | undefined> {
+  if (!persistence) return undefined
+  if (typeof persistence.loadStored === 'function') {
+    const stored = await persistence.loadStored(sessionId)
+    return stored?.events
+  }
+  if (typeof persistence.open === 'function') {
+    const handle = await persistence.open(sessionId, 'read')
+    try {
+      const events: any[] = []
+      for (let offset = 0; ; offset += READ_CHUNK) {
+        const slice = await handle.read(offset, READ_CHUNK)
+        if (!slice || slice.length === 0) break
+        for (const ev of slice) events.push(ev)
+      }
+      return events
+    } finally {
+      if (typeof handle.close === 'function') await handle.close()
+    }
+  }
+  return undefined
+}
+
 /** ------------------------------------------------------------------ route handlers */
 
 async function listSessions(ctx: Context) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return { ok: false, error: 'sessionPersistence 服务不可用' }
   try {
-    const allHeaders = await persistence.list()
+    const allHeaders = normalizeHeaders(await persistence.list())
     // Collect session IDs from all workspaces (current workspace scope)
     const registry = ctx.get('workspaceRegistry')
     let allowedIds: Set<string> | null = null
@@ -95,10 +131,10 @@ async function listSessions(ctx: Context) {
     for (const h of headers) {
       let title = ''
       try {
-        const stored = await persistence.loadStored(h.id)
-        if (stored && stored.events) {
+        const events = await readStoredEvents(persistence, h.id)
+        if (events) {
           // First: look for session/title event (renamed title)
-          for (const event of stored.events) {
+          for (const event of events) {
             if (event.type === 'session/title') {
               const t = event.data?.title || event.data || ''
               if (typeof t === 'string' && t.trim()) {
@@ -109,7 +145,7 @@ async function listSessions(ctx: Context) {
           }
           // Fallback: first user message
           if (!title) {
-            for (const event of stored.events) {
+            for (const event of events) {
               if (event.type === 'user/message' && event.surfaceOp === 'append') {
                 const data = event.data || {}
                 const content = typeof data.content === 'string'
@@ -146,11 +182,11 @@ async function listRounds(ctx: Context, payload: Record<string, unknown>) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return { ok: false, error: 'sessionPersistence 服务不可用' }
   try {
-    const stored = await persistence.loadStored(sessionId)
-    if (!stored || !stored.events) return { ok: false, error: '会话不存在或无事件数据' }
+    const events = await readStoredEvents(persistence, sessionId)
+    if (!events) return { ok: false, error: '会话不存在或无事件数据' }
     const rounds: unknown[] = []
     let turnIndex = 0
-    for (const event of stored.events) {
+    for (const event of events) {
       if (event.type !== 'user/message') continue
       // source.kind === "user" means truly user-typed; "plugin"/"system" are injected context
       const source = event.data?.source
