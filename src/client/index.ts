@@ -142,6 +142,13 @@ function expandGroupForKey(groupKey: string) {
     try { fn(groupKey, true) } catch { /* ignore */ }
   }
 }
+function listClientWorkspaceItems(ctx: Context): Array<{ path: string; workspaceId?: string; id?: string }> {
+  try {
+    const snap = (ctx as any).get?.('workspaces')?.list?.getSnapshot?.()
+    const items = snap?.items ?? snap ?? []
+    return Array.isArray(items) ? items : []
+  } catch { return [] }
+}
 
 // Click all collapsed overflow buttons ("展开其余N个会话") in the sidebar
 function expandAllSessionOverflows() {
@@ -272,15 +279,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       // Expand collapsed workspace group before opening
                       try {
                         if (s.cwd) {
-                          const workspaces = ctx.get?.('workspaceRegistry')?.list?.() || []
+                          const workspaces = listClientWorkspaceItems(ctx)
                           for (const ws of workspaces) {
                             const wsPath = ws.path || ''
                             if (s.cwd === wsPath || s.cwd.startsWith(wsPath + '/') || s.cwd.startsWith(wsPath + '\\')) {
-                              expandGroupForKey(ws.id || wsPath)
+                              expandGroupForKey(ws.workspaceId || (ws as any).id || wsPath)
                               break
                             }
                           }
-                        }
                         }
                       } catch { /* ignore */ }
                       // Expand all collapsed session overflow buttons in sidebar
