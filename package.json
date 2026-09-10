@@ -6,7 +6,8 @@
   "main": "lib/index.mjs",
   "exports": {
     ".": "./lib/index.mjs",
-    "./client": "./lib/client.js"
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
