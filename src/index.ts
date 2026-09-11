@@ -83,16 +83,15 @@ const READ_CHUNK = 500
 
 async function readStoredEvents(persistence: any, sessionId: string): Promise<any[] | undefined> {
   if (!persistence) return undefined
-  if (typeof persistence.loadStored === 'function') {
-    const stored = await persistence.loadStored(sessionId)
-    return stored?.events
-  }
+  // DSH >= 0.1.5: SessionHandle.read() returns { eventState, events } (SessionHandleReadResult).
   if (typeof persistence.open === 'function') {
     const handle = await persistence.open(sessionId, 'read')
     try {
       const events: any[] = []
       for (let offset = 0; ; offset += READ_CHUNK) {
-        const slice = await handle.read(offset, READ_CHUNK)
+        const result = await handle.read(offset, READ_CHUNK)
+        // SessionHandleReadResult: { eventState, events }
+        const slice = Array.isArray(result) ? result : result?.events
         if (!slice || slice.length === 0) break
         for (const ev of slice) events.push(ev)
       }
