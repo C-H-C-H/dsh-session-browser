@@ -27,6 +27,10 @@ interface RoundItem {
 /** ------------------------------------------------------------------ styles */
 
 const CSS = `
+/* sidebar.footer.action layout: ensures all plugin buttons are visible in compatibility mode.
+   In extended/advanced mode the Desktop's own CSS (with !important) overrides this. */
+[data-slot="sidebar.footer.action"]{display:flex!important;flex-direction:column;gap:6px;min-width:0;width:100%;max-height:min(40vh,240px);overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+[data-slot="sidebar.footer.action"]>*{flex:none;min-width:0}
 .ssb_root{box-sizing:border-box;position:relative;display:flex;align-items:center;justify-content:center;flex:none;width:100%}
 .ssb_button{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0 10px;font-size:12px;line-height:18px;white-space:nowrap}
 .ssb_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
