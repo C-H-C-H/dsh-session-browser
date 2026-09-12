@@ -2,6 +2,8 @@
  * dsh-session-browser host half: HTTP routes for session browsing.
  *
  * - `/session-browser/api/list-sessions` — all stored session headers
+ *   (`{ archived?: boolean }`: true → only archived, absent/false → only unarchived;
+ *   every item carries `archived: boolean`; items sorted by `createdAt` desc)
  * - `/session-browser/api/list-rounds` — user messages in a session
  */
 import type { Context } from 'cordis'
@@ -105,10 +107,28 @@ async function readStoredEvents(persistence: any, sessionId: string): Promise<an
 
 /** ------------------------------------------------------------------ route handlers */
 
-async function listSessions(ctx: Context) {
+/**
+ * Read-only archive set: `registry.requireState()` → `state.archivedSessionIds`
+ * (same source as session-manager `unarchiveSession`; reads need no `enqueueOperation`).
+ */
+function readArchivedIds(ctx: Context): Set<string> {
+  try {
+    const registry = ctx.get('workspaceRegistry')
+    if (registry === undefined || typeof registry.requireState !== 'function') return new Set()
+    const ids = registry.requireState()?.archivedSessionIds
+    if (!Array.isArray(ids)) return new Set()
+    return new Set(ids.filter((id: unknown): id is string => typeof id === 'string'))
+  } catch {
+    return new Set()
+  }
+}
+
+async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return { ok: false, error: 'sessionPersistence 服务不可用' }
   try {
+    const archivedOnly = payload?.archived === true
+    const archivedIds = readArchivedIds(ctx)
     const allHeaders = normalizeHeaders(await persistence.list())
     // Collect session IDs from all workspaces (current workspace scope)
     const registry = ctx.get('workspaceRegistry')
@@ -123,6 +143,9 @@ async function listSessions(ctx: Context) {
     const headers = allHeaders.filter((h: any) => {
       if (h.origin === 'subagent') return false
       if (allowedIds !== null && !allowedIds.has(h.id)) return false
+      // 归档分流：已归档页只取交集，未归档页排除已归档 id
+      if (archivedOnly) { if (!archivedIds.has(h.id)) return false }
+      else if (archivedIds.has(h.id)) return false
       return true
     })
     // Derive title from session/title event or first user message
@@ -167,8 +190,10 @@ async function listSessions(ctx: Context) {
         cwd: h.cwd || '',
         createdAt: h.createdAt,
         updatedAt: h.updatedAt || h.createdAt,
+        archived: archivedIds.has(h.id),
       })
     }
+    items.sort((a: any, b: any) => b.createdAt - a.createdAt)
     return { ok: true, items }
   } catch (err) {
     return { ok: false, error: String(err instanceof Error ? err.message : err) }
@@ -237,7 +262,7 @@ export function apply(ctx: Context) {
       try {
         const payload = await readJsonBody(req)
         if (method === 'list-sessions') {
-          writeJson(res, 200, await listSessions(ctx))
+          writeJson(res, 200, await listSessions(ctx, payload))
           return
         }
         if (method === 'list-rounds') {
