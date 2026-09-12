@@ -5,9 +5,14 @@
  *   (`{ archived?: boolean }`: true → only archived, absent/false → only unarchived;
  *   every item carries `archived: boolean`; items sorted by `createdAt` desc)
  * - `/session-browser/api/list-rounds` — user messages in a session
+ * - `/session-browser/api/archive` — `{ sessionId }` → `{ ok: true }`
+ * - `/session-browser/api/unarchive` — `{ sessionId }` → `{ ok: true }`
+ * - `/session-browser/api/delete` — `{ sessionId }` → `{ ok: true }`
  */
 import type { Context } from 'cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 /** Stable plugin name. */
 export const name = 'dsh-session-browser'
@@ -106,6 +111,169 @@ async function readStoredEvents(persistence: any, sessionId: string): Promise<an
 }
 
 /** ------------------------------------------------------------------ route handlers */
+
+/**
+ * Add one id to the registry-global archive set (durable, serialized).
+ * Symmetric mirror of session-manager `unarchiveSession`: idempotent, writes
+ * go through `enqueueOperation` + `setState` so a restart keeps the state.
+ */
+async function archiveSession(ctx: Context, sessionId: string): Promise<void> {
+  const registry: any = ctx.get('workspaceRegistry')
+  if (registry === undefined || typeof registry.enqueueOperation !== 'function') throw new Error('workspaceRegistry 服务不可用')
+  await registry.enqueueOperation(async () => {
+    const state = registry.requireState()
+    if (state.archivedSessionIds.includes(sessionId)) return
+    await registry.setState({
+      ...state,
+      archivedSessionIds: [...state.archivedSessionIds, sessionId],
+    })
+  })
+}
+
+/**
+ * Remove one id from the registry-global archive set (durable, serialized).
+ * Ported from session-manager `unarchiveSession` (ctx.get replaces ctx property).
+ */
+async function unarchiveSession(ctx: Context, sessionId: string): Promise<void> {
+  const registry: any = ctx.get('workspaceRegistry')
+  if (registry === undefined || typeof registry.enqueueOperation !== 'function') throw new Error('workspaceRegistry 服务不可用')
+  await registry.enqueueOperation(async () => {
+    const state = registry.requireState()
+    if (!state.archivedSessionIds.includes(sessionId)) return
+    await registry.setState({
+      ...state,
+      archivedSessionIds: state.archivedSessionIds.filter((id: string) => id !== sessionId),
+    })
+  })
+}
+
+/**
+ * Detach one session from every workspace's ordered accounting.
+ * Ported from session-manager `detachFromWorkspaces` (ctx.get replaces ctx
+ * property; tolerates function-shaped sessionIds like listSessions does).
+ */
+async function detachFromWorkspaces(ctx: Context, sessionId: string): Promise<void> {
+  const registry: any = ctx.get('workspaceRegistry')
+  if (registry === undefined || typeof registry.list !== 'function') throw new Error('workspaceRegistry 服务不可用')
+  for (const entity of registry.list()) {
+    const ids = typeof entity.sessionIds === 'function' ? entity.sessionIds() : entity.sessionIds
+    if (Array.isArray(ids) && ids.includes(sessionId)) {
+      await entity.detachSession(sessionId)
+    }
+  }
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Resolve the on-disk session directory (parent of its artifact), if any. Ported from session-manager. */
+async function sessionDirOf(ctx: Context, sessionId: string): Promise<string | undefined> {
+  const persistence: any = ctx.get('sessionPersistence')
+  if (persistence === undefined) return undefined
+  const headers = normalizeHeaders(await persistence.list())
+  const meta = headers.find((header: any) => header.id === sessionId)
+  if (meta === undefined) return undefined
+  const location = persistence.locate(meta)
+  if (location === undefined) return undefined
+  return dirname(location.path)
+}
+
+/**
+ * Delete one session end to end: live session teardown → `entry.detach()` →
+ * flush/remove JSONL artifact dir → remove workspace accounting → remove
+ * archive-set membership. Ported from session-manager `deleteSession`
+ * (unrelated move/preset branches dropped; `sessions`/`agents` are optional
+ * here until Task 3 extends `inject`, so absent services skip live teardown).
+ */
+async function deleteSession(ctx: Context, sessionId: string): Promise<void> {
+  const liveSessions: any = ctx.get('sessions')
+  const liveAgents: any = ctx.get('agents')
+  const session = liveSessions?.get?.(sessionId)
+  const agent = liveAgents?.get?.(sessionId)
+
+  if (agent !== undefined) {
+    // Stop any running turn (disposed-kind suppresses re-wake).
+    agent.cancel({ kind: 'disposed' })
+    // Quiesce the agent's own fiber (idempotent; bounded in case teardown stalls).
+    if (typeof agent.scope?.dispose === 'function') {
+      await Promise.race([agent.scope.dispose(), sleep(3000)])
+    }
+    // Drop the zombie from the registry so a later session.create/open with
+    // the same id cannot resurrect it.
+    try {
+      liveAgents.store?.delete?.(sessionId)
+    } catch { /* best-effort */ }
+  }
+
+  let detached = false
+  if (session !== undefined) {
+    // Flush buffered events to disk first so the retirement drain is a no-op.
+    try {
+      await liveSessions.flush(session)
+    } catch { /* best-effort */ }
+    // Detach the session store entry: emits session/disposed, which the
+    // persistence write-path answers with a final drain, and the API proxy
+    // relays as host/session-removed so every connected client drops the row.
+    try {
+      const entry = liveSessions.store?.get?.(sessionId)
+      if (entry !== undefined && typeof entry.detach === 'function') {
+        entry.detach()
+        await sleep(200) // let the write-behind retirement settle
+        detached = true
+      }
+    } catch { /* best-effort */ }
+  }
+  // Sessions with a stored artifact but no live store row never fire
+  // entry.detach() — emit session/disposed explicitly so every connected
+  // client drops the row.
+  if (!detached) {
+    try {
+      if (typeof (ctx as any).emit === 'function') (ctx as any).emit('session/disposed', { id: sessionId })
+    } catch { /* best-effort */ }
+  }
+
+  // Workspace accounting + archive-set membership.
+  await detachFromWorkspaces(ctx, sessionId)
+  await unarchiveSession(ctx, sessionId)
+
+  // Physical artifact (session.jsonl / session.jsonl.zstd) + any extras.
+  const dir = await sessionDirOf(ctx, sessionId)
+  if (dir !== undefined) {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+function requireSessionId(payload: Record<string, unknown>): string {
+  const sessionId = payload?.sessionId
+  if (typeof sessionId !== 'string' || sessionId.trim() === '') throw new Error('sessionId 必填')
+  return sessionId.trim()
+}
+
+async function handleArchive(ctx: Context, payload: Record<string, unknown>) {
+  try {
+    await archiveSession(ctx, requireSessionId(payload))
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String(err instanceof Error ? err.message : err) }
+  }
+}
+
+async function handleUnarchive(ctx: Context, payload: Record<string, unknown>) {
+  try {
+    await unarchiveSession(ctx, requireSessionId(payload))
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String(err instanceof Error ? err.message : err) }
+  }
+}
+
+async function handleDelete(ctx: Context, payload: Record<string, unknown>) {
+  try {
+    await deleteSession(ctx, requireSessionId(payload))
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String(err instanceof Error ? err.message : err) }
+  }
+}
 
 /**
  * Read-only archive set: `registry.requireState()` → `state.archivedSessionIds`
@@ -267,6 +435,18 @@ export function apply(ctx: Context) {
         }
         if (method === 'list-rounds') {
           writeJson(res, 200, await listRounds(ctx, payload))
+          return
+        }
+        if (method === 'archive') {
+          writeJson(res, 200, await handleArchive(ctx, payload))
+          return
+        }
+        if (method === 'unarchive') {
+          writeJson(res, 200, await handleUnarchive(ctx, payload))
+          return
+        }
+        if (method === 'delete') {
+          writeJson(res, 200, await handleDelete(ctx, payload))
           return
         }
         writeJson(res, 404, { ok: false, error: `unknown method "${method}"` })
