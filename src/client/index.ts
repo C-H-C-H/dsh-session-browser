@@ -234,6 +234,24 @@ function apiError(res: any, fallback: string): string {
   return (res && typeof res.error === 'string' && res.error !== '') ? res.error : fallback
 }
 
+function mapWorkspaceList(list: unknown): Array<{ id: string; name?: string; title?: string; path?: string }> {
+  if (!Array.isArray(list)) return []
+  return (list as any[])
+    .map((w: any) => ({ id: String(w.id ?? w.workspaceId ?? ''), name: w.name, title: w.title, path: w.path }))
+    .filter((w: { id: string }) => w.id !== '')
+}
+
+// Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
+// reopen-if-current. Shared by the Panel row action (Task 5) and the header
+// action (Task 6); each caller schedules the 250/900ms delayed legs itself
+// (Task 3 record).
+async function refreshMovedSession(ctx: Context, sessionId: string, wasCurrent: boolean): Promise<void> {
+  try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  if (wasCurrent) {
+    try { if (sessionsStoreById(ctx)[sessionId] !== undefined) (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+  }
+}
+
 function browseIcon(): ReturnType<typeof createElement> {
   return createElement('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
     createElement('rect', { x: 2, y: 2, width: 12, height: 12, rx: 2, stroke: 'currentColor', strokeWidth: 1.5 }),
@@ -378,13 +396,16 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     setNotice(''); setNoticeOk(false)
   }
 
-  // Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
-  // reopen-if-current, plus the 250/900ms delayed re-refreshes (Task 3 record).
-  const refreshMovedSession = async (sessionId: string, wasCurrent: boolean): Promise<void> => {
-    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
-    if (wasCurrent) {
-      try { if (sessionsStoreById(ctx)[sessionId] !== undefined) (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
-    }
+  const onMove = async (sessionId: string, targetWorkspaceId: string): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const wasCurrent = currentOpenSessionId(ctx) === sessionId
+    const res: any = await callApi('move', { sessionId, targetWorkspaceId })
+    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); setNoticeOk(false); return }
+    setNotice('移动成功'); setNoticeOk(true)
+    reloadSessions(tab)
+    await refreshMovedSession(ctx, sessionId, wasCurrent)
+    setTimeout(() => { refreshMovedSession(ctx, sessionId, wasCurrent) }, 250)
+    setTimeout(() => { refreshMovedSession(ctx, sessionId, wasCurrent) }, 900)
   }
 
   const onArchive = async (s: SessionItem): Promise<void> => {
@@ -415,18 +436,6 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     }
     if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
     reloadSessions(tab)
-  }
-
-  const onMove = async (sessionId: string, targetWorkspaceId: string): Promise<void> => {
-    setNotice(''); setNoticeOk(false)
-    const wasCurrent = currentOpenSessionId(ctx) === sessionId
-    const res: any = await callApi('move', { sessionId, targetWorkspaceId })
-    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); setNoticeOk(false); return }
-    setNotice('移动成功'); setNoticeOk(true)
-    reloadSessions(tab)
-    await refreshMovedSession(sessionId, wasCurrent)
-    setTimeout(() => { refreshMovedSession(sessionId, wasCurrent) }, 250)
-    setTimeout(() => { refreshMovedSession(sessionId, wasCurrent) }, 900)
   }
 
   const onMigrate = async (sessionId: string, toPreset: string): Promise<void> => {
@@ -461,9 +470,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     callApi('workspaces', {}).then((res: any) => {
       const list = res?.ok ? res?.result?.workspaces : undefined
       if (!res?.ok || !Array.isArray(list)) { setNotice(apiError(res, '加载工作区列表失败')); setNoticeOk(false); return }
-      const mapped = list
-        .map((w: any) => ({ id: String(w.id ?? w.workspaceId ?? ''), name: w.name, title: w.title, path: w.path }))
-        .filter((w: { id: string }) => w.id !== '')
+      const mapped = mapWorkspaceList(list)
       setWsList(mapped)
       if (mapped.length > 0) setMoveWs(mapped[0].id)
     })
@@ -738,6 +745,343 @@ function SidebarButton({ ctx }: { ctx: Context }) {
   )
 }
 
+/** ------------------------------------------------------------------ Task 6: header actions.
+ * Port of dsh-session-manager HeaderAction (+ ConfirmDialog + MoveDialog) with
+ * ZERO behavior change. Deliberate adaptations, all per brief:
+ * - NO locale service: the Chinese copy below is the old session-manager zh
+ *   dictionary verbatim (归档/移出归档/移动至工作区/删除会话/删除会话…不可撤销/
+ *   移动会话到工作区…/没有可移动到的其他工作区/选择目标工作区/确认删除/
+ *   确认移动/取消/操作失败：{message}).
+ * - API base is this plugin's callApi ('archive' / 'unarchive' / 'delete' /
+ *   'move' / 'workspaces' routes) instead of session-manager's paths.
+ * - Archived state comes from `list-sessions { archived: true }` (this client
+ *   has no useWorkspaces hook; inject stays ['slots', 'sessions'], workspaces
+ *   is reached lazily only for refresh, like listClientWorkspaceItems).
+ * - Dialogs render via createPortal + inline styles (CSS block untouched).
+ */
+
+interface HeaderAnchor { top: number; left: number }
+
+function headerAnchorFor(el: any): HeaderAnchor | null {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return null
+  const r = el.getBoundingClientRect()
+  return {
+    top: Math.round(r.top + r.height + 6),
+    left: Math.max(8, Math.round(r.right - 320)),
+  }
+}
+
+function headerCardStyle(anchor: HeaderAnchor | null): Record<string, string> {
+  const base: Record<string, string> = {
+    width: '300px',
+    maxWidth: 'calc(100vw - 32px)',
+    background: 'var(--dsw-specific-tip)',
+    border: '1px solid var(--dsw-alias-border-l2)',
+    borderRadius: '10px',
+    padding: '12px',
+    boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+  }
+  if (anchor) {
+    base.position = 'fixed'
+    base.top = `${anchor.top}px`
+    base.left = `${anchor.left}px`
+    base.zIndex = '2147483001'
+  }
+  return base
+}
+
+function HeaderConfirmDialog({ open, title, description, confirmLabel, cancelLabel, anchor, onCancel, onConfirm }: {
+  open: boolean; title: string; description: string; confirmLabel: string; cancelLabel: string
+  anchor: HeaderAnchor | null; onCancel: () => void; onConfirm: () => void
+}) {
+  if (!open) return null
+  const centered = anchor === null
+  return createPortal(createElement('div', {
+    role: 'presentation',
+    tabIndex: -1,
+    onKeyDown: (e: any) => {
+      if (e.key === 'Escape') { e.preventDefault(); onCancel() }
+      else if (e.key === 'Enter') { e.preventDefault(); onConfirm() }
+    },
+    style: centered
+      ? { position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.25)', zIndex: 2147483001 }
+      : { position: 'fixed', inset: 0, zIndex: 2147483001, background: 'transparent' },
+  },
+    centered ? null : createElement('div', {
+      onMouseDown: (e: any) => { if (e.target === e.currentTarget) onCancel() },
+      style: { position: 'fixed', inset: 0, background: 'transparent' },
+    }),
+    createElement('section', {
+      role: 'dialog', 'aria-modal': 'true',
+      ref: (el: any) => { if (el && typeof el.focus === 'function') el.focus() },
+      style: headerCardStyle(anchor),
+    },
+      createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, title),
+      description
+        ? createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '10px', wordBreak: 'break-word' } }, description)
+        : null,
+      createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+        createElement('button', { type: 'button', onClick: onCancel }, cancelLabel),
+        createElement('button', { type: 'button', onClick: onConfirm }, confirmLabel)
+      )
+    )
+  ), document.body)
+}
+
+function HeaderMoveDialog({ open, title, description, workspaces, currentWorkspaceId, confirmLabel, cancelLabel, anchor, onCancel, onConfirm }: {
+  open: boolean; title: string; description: string
+  workspaces: Array<{ id: string; name?: string; title?: string; path?: string }>
+  currentWorkspaceId: string; confirmLabel: string; cancelLabel: string
+  anchor: HeaderAnchor | null; onCancel: () => void; onConfirm: (targetWorkspaceId: string) => void
+}) {
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('')
+  if (!open) return null
+  const list = (Array.isArray(workspaces) ? workspaces : [])
+    .filter((ws) => ws && typeof ws === 'object' && typeof ws.id === 'string' && ws.id !== currentWorkspaceId)
+  const centered = anchor === null
+  return createPortal(createElement('div', {
+    role: 'presentation',
+    tabIndex: -1,
+    onKeyDown: (e: any) => {
+      if (e.key === 'Escape') { e.preventDefault(); onCancel() }
+      else if (e.key === 'Enter' && selectedWorkspaceId !== '' && list.length > 0) { e.preventDefault(); onConfirm(selectedWorkspaceId) }
+    },
+    style: centered
+      ? { position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.25)', zIndex: 2147483001 }
+      : { position: 'fixed', inset: 0, zIndex: 2147483001, background: 'transparent' },
+  },
+    centered ? null : createElement('div', {
+      onMouseDown: (e: any) => { if (e.target === e.currentTarget) onCancel() },
+      style: { position: 'fixed', inset: 0, background: 'transparent' },
+    }),
+    createElement('section', {
+      role: 'dialog', 'aria-modal': 'true',
+      ref: (el: any) => { if (el && typeof el.focus === 'function') el.focus() },
+      style: headerCardStyle(anchor),
+    },
+      createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, title),
+      createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', wordBreak: 'break-word' } }, description),
+      list.length === 0
+        ? createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '10px' } }, '没有可移动到的其他工作区。')
+        : createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '10px' } },
+            createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } }, '选择目标工作区'),
+            createElement('div', { role: 'listbox', 'aria-label': '选择目标工作区', style: { display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '200px', overflow: 'auto' } },
+              list.map((ws) => createElement('button', {
+                key: ws.id,
+                type: 'button',
+                role: 'option',
+                'aria-selected': selectedWorkspaceId === ws.id,
+                onClick: () => setSelectedWorkspaceId(ws.id),
+                style: {
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '8px 12px', cursor: 'pointer', textAlign: 'left',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px',
+                  background: selectedWorkspaceId === ws.id ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+                  borderColor: selectedWorkspaceId === ws.id ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-border-l2)',
+                },
+              },
+                createElement('span', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-primary)' } }, String(ws.title || ws.name || ws.id)),
+                createElement('span', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' } }, ws.path ? String(ws.path) : '')
+              ))
+            )
+          ),
+      createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+        createElement('button', { type: 'button', onClick: onCancel }, cancelLabel),
+        createElement('button', {
+          type: 'button',
+          disabled: selectedWorkspaceId === '' || list.length === 0,
+          onClick: () => { if (selectedWorkspaceId !== '') onConfirm(selectedWorkspaceId) },
+        }, confirmLabel)
+      )
+    )
+  ), document.body)
+}
+
+function HeaderAction({ ctx, sessionId }: { ctx: Context; sessionId: string }) {
+  const [archived, setArchived] = useState(false)
+  const [confirmFor, setConfirmFor] = useState<{ id: string; displayTitle: string } | null>(null)
+  const [confirmAnchor, setConfirmAnchor] = useState<HeaderAnchor | null>(null)
+  const [moveFor, setMoveFor] = useState<{ id: string; displayTitle: string; workspaceId: string } | null>(null)
+  const [moveAnchor, setMoveAnchor] = useState<HeaderAnchor | null>(null)
+  const [workspaces, setWorkspaces] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
+
+  // Archived state: this client has no useWorkspaces hook, so read the
+  // host-authoritative set via list-sessions (same archivedSessionIds source
+  // the host filters by). Re-read per session + after our own toggles below.
+  useEffect(() => {
+    let alive = true
+    setArchived(false)
+    if (typeof sessionId === 'string' && sessionId !== '') {
+      callApi('list-sessions', { archived: true }).then((res: any) => {
+        if (!alive) return
+        const items = res?.ok ? res?.items : undefined
+        if (Array.isArray(items) && items.some((i: any) => i?.sessionId === sessionId)) setArchived(true)
+      })
+    }
+    return () => { alive = false }
+  }, [sessionId])
+
+  // Mirror of the session-manager HeaderAction workspaces effect (route adapted).
+  useEffect(() => {
+    if (!moveFor) { setWorkspaces([]); return }
+    let alive = true
+    callApi('workspaces', {}).then((res: any) => {
+      if (!alive) return
+      if (res?.ok) setWorkspaces(mapWorkspaceList(res?.result?.workspaces))
+    })
+    return () => { alive = false }
+  }, [moveFor ? moveFor.id : null])
+
+  // Mirror of session-manager runWithAlert: errors surface via window.alert
+  // with the hardcoded Chinese template (host error strings only, no secrets).
+  const runWithAlert = (fn: () => Promise<unknown>): Promise<void> => {
+    return Promise.resolve()
+      .then(() => fn())
+      .catch((e) => {
+        try {
+          const msg = e instanceof Error ? e.message : String(e)
+          window.alert('操作失败：{message}'.replace('{message}', msg))
+        } catch { /* ignore */ }
+      })
+  }
+
+  const doArchive = (): Promise<void> => runWithAlert(async () => {
+    const res: any = await callApi('archive', { sessionId })
+    if (!res?.ok) throw new Error(apiError(res, '归档失败'))
+    setArchived(true)
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  })
+
+  const doUnarchive = (): Promise<void> => runWithAlert(async () => {
+    const res: any = await callApi('unarchive', { sessionId })
+    if (!res?.ok) throw new Error(apiError(res, '移出归档失败'))
+    setArchived(false)
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  })
+
+  const doRemove = (id: string): Promise<void> => runWithAlert(async () => {
+    const wasCurrent = currentOpenSessionId(ctx) === id
+    const res: any = await callApi('delete', { sessionId: id })
+    if (!res?.ok) throw new Error(apiError(res, '删除会话失败'))
+    // Same rule as session-manager: deleting the open session clears it so the
+    // main UI does not show a removed session.
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+    }
+  })
+
+  const doMove = (id: string, targetWorkspaceId: string): Promise<void> => runWithAlert(async () => {
+    const wasCurrent = currentOpenSessionId(ctx) === id
+    const res: any = await callApi('move', { sessionId: id, targetWorkspaceId })
+    if (!res?.ok) throw new Error(apiError(res, '移动会话失败'))
+    await refreshMovedSession(ctx, id, wasCurrent)
+    setTimeout(() => { refreshMovedSession(ctx, id, wasCurrent) }, 250)
+    setTimeout(() => { refreshMovedSession(ctx, id, wasCurrent) }, 900)
+  })
+
+  if (typeof sessionId !== 'string' || sessionId === '') return null
+
+  const headerBtn = (label: string, active: boolean, props: Record<string, any>) =>
+    createElement('button', {
+      type: 'button',
+      'aria-label': label,
+      ...props,
+      style: {
+        boxSizing: 'border-box',
+        minHeight: '28px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        padding: '3px 10px',
+        fontSize: '12px',
+        lineHeight: '18px',
+        whiteSpace: 'nowrap',
+        color: 'var(--dsw-alias-label-secondary)',
+        background: active ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '999px',
+        cursor: 'pointer',
+      },
+    }, label)
+
+  return createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+    headerBtn(archived ? '移出归档' : '归档', archived, {
+      key: 'archive',
+      onClick: () => { if (archived) void doUnarchive(); else void doArchive() },
+    }),
+    headerBtn('移动至工作区', moveFor !== null, {
+      key: 'move',
+      onClick: (e: any) => {
+        try { e.stopPropagation() } catch { /* ignore */ }
+        setConfirmFor(null)
+        setConfirmAnchor(null)
+        if (moveFor && moveFor.id === sessionId) {
+          setMoveFor(null)
+          setMoveAnchor(null)
+        } else {
+          setMoveAnchor(headerAnchorFor(e.currentTarget))
+          setMoveFor({ id: sessionId, displayTitle: sessionId, workspaceId: '' })
+        }
+      },
+    }),
+    headerBtn('删除会话', confirmFor !== null, {
+      key: 'delete',
+      onClick: (e: any) => {
+        try { e.stopPropagation() } catch { /* ignore */ }
+        setMoveFor(null)
+        setMoveAnchor(null)
+        if (confirmFor && confirmFor.id === sessionId) {
+          setConfirmFor(null)
+          setConfirmAnchor(null)
+        } else {
+          setConfirmAnchor(headerAnchorFor(e.currentTarget))
+          setConfirmFor({ id: sessionId, displayTitle: sessionId })
+        }
+      },
+    }),
+    confirmFor
+      ? createElement(HeaderConfirmDialog, {
+          key: 'deleteConfirm',
+          open: true,
+          anchor: confirmAnchor,
+          onCancel: () => { setConfirmFor(null); setConfirmAnchor(null) },
+          onConfirm: () => {
+            const target = confirmFor
+            setConfirmFor(null)
+            setConfirmAnchor(null)
+            void doRemove(target.id)
+          },
+          title: '删除会话',
+          description: '会话「{title}」将被永久删除，包括其全部消息记录与磁盘文件，此操作不可撤销。'
+            .replace('{title}', confirmFor.displayTitle || confirmFor.id),
+          confirmLabel: '确认删除',
+          cancelLabel: '取消',
+        })
+      : null,
+    moveFor
+      ? createElement(HeaderMoveDialog, {
+          key: 'moveDialog',
+          open: true,
+          anchor: moveAnchor,
+          workspaces,
+          currentWorkspaceId: moveFor.workspaceId || '',
+          onCancel: () => { setMoveFor(null); setMoveAnchor(null) },
+          onConfirm: (targetWorkspaceId: string) => {
+            const target = moveFor
+            setMoveFor(null)
+            setMoveAnchor(null)
+            void doMove(target.id, targetWorkspaceId)
+          },
+          title: '移动会话到工作区',
+          description: '将会话「{title}」移动到目标工作区。'
+            .replace('{title}', moveFor.displayTitle || moveFor.id),
+          confirmLabel: '确认移动',
+          cancelLabel: '取消',
+        })
+      : null
+  )
+}
+
 /** ------------------------------------------------------------------ plugin */
 
 export const inject = ['slots', 'sessions']
@@ -749,5 +1093,9 @@ export function apply(ctx: Context) {
   slots.inject('sidebar.footer.action', () => slots.register(
     { name: 'sidebar.footer.action', id: 'dsh-session-browser', order: 20 },
     () => createElement(SidebarButton, { ctx })
+  ))
+  slots.inject('conversation.session.header.actions', () => slots.register(
+    { name: 'conversation.session.header.actions', id: 'session-manager-header', order: 40 },
+    (slotProps: any) => createElement(HeaderAction, { ctx, sessionId: slotProps?.sessionId })
   ))
 }
