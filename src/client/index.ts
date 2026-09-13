@@ -168,6 +168,66 @@ function expandAllSessionOverflows() {
   } catch { /* ignore */ }
 }
 
+/** ------------------------------------------------------------------ Task 5: row actions.
+ * Best-effort read of the currently-open session id. The sessions service
+ * shape is host-version dependent, so several accessor shapes are tried;
+ * unknown shapes yield undefined (callers treat that as "not current").
+ * Recorded here because dsh-session-manager's client source is unavailable;
+ * only the behavior contract (reopen-if-current / clear-if-current) is ported.
+ */
+function currentOpenSessionId(ctx: Context): string | undefined {
+  try {
+    const svc = (ctx as any).sessions
+    if (!svc) return undefined
+    const fields = [svc.currentSessionId, svc.currentId, svc.current]
+    for (const f of fields) {
+      if (typeof f === 'string' && f !== '') return f
+      if (f && typeof f === 'object') {
+        if (typeof f.sessionId === 'string' && f.sessionId !== '') return f.sessionId
+        if (typeof f.id === 'string' && f.id !== '') return f.id
+      }
+    }
+    if (typeof svc.getCurrent === 'function') {
+      const cur = svc.getCurrent()
+      if (typeof cur === 'string' && cur !== '') return cur
+      if (cur && typeof cur === 'object') {
+        if (typeof cur.sessionId === 'string' && cur.sessionId !== '') return cur.sessionId
+        if (typeof cur.id === 'string' && cur.id !== '') return cur.id
+      }
+    }
+  } catch { /* ignore */ }
+  return undefined
+}
+
+function sessionsStoreById(ctx: Context): Record<string, any> {
+  try {
+    const snap = (ctx as any).sessions?.list?.getSnapshot?.()
+    if (snap && typeof snap.byId === 'object' && snap.byId !== null) return snap.byId
+  } catch { /* ignore */ }
+  return {}
+}
+
+function refreshSessionsStore(ctx: Context): Promise<unknown> {
+  try {
+    const p = (ctx as any).sessions?.refresh?.()
+    if (p && typeof p.then === 'function') return p.catch(() => undefined)
+  } catch { /* ignore */ }
+  return Promise.resolve(undefined)
+}
+
+function refreshWorkspacesStore(ctx: Context): Promise<unknown> {
+  try {
+    const svc = (ctx as any).workspaces ?? (ctx as any).get?.('workspaces')
+    const p = svc?.refresh?.()
+    if (p && typeof p.then === 'function') return p.catch(() => undefined)
+  } catch { /* ignore */ }
+  return Promise.resolve(undefined)
+}
+
+function apiError(res: any, fallback: string): string {
+  return (res && typeof res.error === 'string' && res.error !== '') ? res.error : fallback
+}
+
 function browseIcon(): ReturnType<typeof createElement> {
   return createElement('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
     createElement('rect', { x: 2, y: 2, width: 12, height: 12, rx: 2, stroke: 'currentColor', strokeWidth: 1.5 }),
@@ -242,13 +302,19 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [filter, setFilter] = useState('')
   const [tab, setTab] = useState<'active' | 'archived'>('active')
   const [loading, setLoading] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [moveTarget, setMoveTarget] = useState<SessionItem | null>(null)
+  const [moveWs, setMoveWs] = useState('')
+  const [wsList, setWsList] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
+  const [migrateTarget, setMigrateTarget] = useState<SessionItem | null>(null)
+  const [migratePreset, setMigratePreset] = useState('')
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
-  useEffect(() => {
-    callApi('list-sessions', { archived: tab === 'archived' }).then((res: any) => {
-      if (!res.ok) return
+  const reloadSessions = (forTab: 'active' | 'archived') => {
+    callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
+      if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); return }
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
       let liveById: Record<string, any> = {}
@@ -266,6 +332,10 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       })
       setSessions(merged)
     })
+  }
+
+  useEffect(() => {
+    reloadSessions(tab)
   }, [tab])
 
   useEffect(() => {
@@ -298,7 +368,124 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     setSelected(null)
     setRounds([])
     setLoading(false)
+    setNotice('')
   }
+
+  // Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
+  // reopen-if-current, plus the 250/900ms delayed re-refreshes (Task 3 record).
+  const refreshMovedSession = async (sessionId: string, wasCurrent: boolean): Promise<void> => {
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+    if (wasCurrent) {
+      try { if (sessionsStoreById(ctx)[sessionId] !== undefined) (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+    }
+  }
+
+  const onArchive = async (s: SessionItem): Promise<void> => {
+    setNotice('')
+    const res: any = await callApi('archive', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '归档失败')); return }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onUnarchive = async (s: SessionItem): Promise<void> => {
+    setNotice('')
+    const res: any = await callApi('unarchive', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '移出归档失败')); return }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onRemove = async (s: SessionItem): Promise<void> => {
+    setNotice('')
+    const wasCurrent = currentOpenSessionId(ctx) === s.sessionId
+    const res: any = await callApi('delete', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '删除会话失败')); return }
+    // Same rule as session-manager: deleting the open session clears it so the
+    // main UI does not show a removed session.
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+    }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onMove = async (sessionId: string, targetWorkspaceId: string): Promise<void> => {
+    setNotice('')
+    const wasCurrent = currentOpenSessionId(ctx) === sessionId
+    const res: any = await callApi('move', { sessionId, targetWorkspaceId })
+    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); return }
+    setNotice('移动成功')
+    reloadSessions(tab)
+    await refreshMovedSession(sessionId, wasCurrent)
+    setTimeout(() => { refreshMovedSession(sessionId, wasCurrent) }, 250)
+    setTimeout(() => { refreshMovedSession(sessionId, wasCurrent) }, 900)
+  }
+
+  const onMigrate = async (sessionId: string, toPreset: string): Promise<void> => {
+    setNotice('')
+    const wasCurrent = currentOpenSessionId(ctx) === sessionId
+    const res: any = await callApi('preset-migrate', { sessionId, toPreset })
+    if (!res?.ok) { setNotice(apiError(res, '迁移预设失败')); return }
+    setNotice('迁移成功')
+    try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
+    try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+    }
+    reloadSessions(tab)
+    // Single 250ms delayed baseline (no 900ms leg — Task 3 record).
+    setTimeout(() => {
+      refreshSessionsStore(ctx).then(() => {
+        try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
+        if (wasCurrent) {
+          try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+        }
+      })
+    }, 250)
+  }
+
+  const openMoveDialog = (s: SessionItem) => {
+    setNotice('')
+    setMigrateTarget(null)
+    setMoveTarget(s)
+    setMoveWs('')
+    setWsList([])
+    callApi('workspaces', {}).then((res: any) => {
+      const list = res?.ok ? res?.result?.workspaces : undefined
+      if (!res?.ok || !Array.isArray(list)) { setNotice(apiError(res, '加载工作区列表失败')); return }
+      const mapped = list
+        .map((w: any) => ({ id: String(w.id ?? w.workspaceId ?? ''), name: w.name, title: w.title, path: w.path }))
+        .filter((w: { id: string }) => w.id !== '')
+      setWsList(mapped)
+      if (mapped.length > 0) setMoveWs(mapped[0].id)
+    })
+  }
+
+  const openMigrateDialog = (s: SessionItem) => {
+    setNotice('')
+    setMoveTarget(null)
+    setMigrateTarget(s)
+    setMigratePreset('')
+  }
+
+  const rowBtn = (label: string, s: SessionItem, onPress: (row: SessionItem) => void) =>
+    createElement('button', {
+      key: label,
+      type: 'button',
+      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } onPress(s) },
+      style: {
+        border: '1px solid var(--dsw-alias-border-l2)',
+        background: 'transparent',
+        color: 'var(--dsw-alias-label-secondary)',
+        fontSize: '11px',
+        lineHeight: '16px',
+        padding: '1px 8px',
+        borderRadius: '6px',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      },
+    }, label)
 
   const tabBtn = (id: 'active' | 'archived', label: string) =>
     createElement('button', {
@@ -335,6 +522,22 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
         ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
       ),
+      notice
+        ? createElement('div', {
+            key: 'notice',
+            style: {
+              flex: 'none',
+              fontSize: '11px',
+              lineHeight: '16px',
+              color: 'var(--dsw-alias-state-danger, #c53b3b)',
+              padding: '6px 12px',
+              borderBottom: '1px solid var(--dsw-alias-border-l2)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            },
+          }, notice)
+        : null,
       createElement('div', { key: 'body', className: 'ssb_body' },
         // Left: session list
         createElement('div', { key: 'sessions', className: 'ssb_sessionList' },
@@ -375,7 +578,17 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     },
                   },
                     createElement('div', { className: 'ssb_sessionTitle' }, s.title || '(未命名)'),
-                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt))
+                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt)),
+                    createElement('div', {
+                      key: 'actions',
+                      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+                      style: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '4px' },
+                    },
+                      s.archived ? rowBtn('移出归档', s, onUnarchive) : rowBtn('归档', s, onArchive),
+                      rowBtn('删除', s, onRemove),
+                      rowBtn('移动', s, openMoveDialog),
+                      rowBtn('迁移', s, openMigrateDialog)
+                    )
                   )
                 )
           )
@@ -408,7 +621,93 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       )
                     })
           )
-        )
+        ),
+        moveTarget
+          ? createElement('div', {
+              key: 'moveDlg',
+              onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+              style: {
+                position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(0,0,0,0.25)', zIndex: 1,
+              },
+            },
+              createElement('div', {
+                style: {
+                  width: '300px', maxWidth: 'calc(100% - 32px)', background: 'var(--dsw-specific-tip)',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '10px', padding: '12px',
+                  boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+                },
+              },
+                createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, '移动会话'),
+                createElement('div', {
+                  style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                }, moveTarget.title || '(未命名)'),
+                createElement('select', {
+                  value: moveWs,
+                  onChange: (e: any) => setMoveWs(e.target.value),
+                  style: { width: '100%', fontSize: '12px', padding: '4px 6px', marginBottom: '10px' },
+                }, wsList.map(w => createElement('option', { key: w.id, value: w.id }, w.title || w.name || w.path || w.id))),
+                createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+                  createElement('button', { type: 'button', onClick: () => setMoveTarget(null) }, '取消'),
+                  createElement('button', {
+                    type: 'button',
+                    onClick: () => {
+                      const t = moveTarget
+                      const ws = moveWs
+                      if (!t) return
+                      if (!ws) { setNotice('请选择目标工作区'); return }
+                      setMoveTarget(null)
+                      onMove(t.sessionId, ws)
+                    },
+                  }, '确认')
+                )
+              )
+            )
+          : null,
+        migrateTarget
+          ? createElement('div', {
+              key: 'migrateDlg',
+              onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+              style: {
+                position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(0,0,0,0.25)', zIndex: 1,
+              },
+            },
+              createElement('div', {
+                style: {
+                  width: '300px', maxWidth: 'calc(100% - 32px)', background: 'var(--dsw-specific-tip)',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '10px', padding: '12px',
+                  boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+                },
+              },
+                createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, '迁移预设'),
+                createElement('div', {
+                  style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                }, migrateTarget.title || '(未命名)'),
+                createElement('input', {
+                  type: 'text',
+                  placeholder: '目标预设',
+                  value: migratePreset,
+                  onChange: (e: any) => setMigratePreset(e.target.value),
+                  style: { width: '100%', boxSizing: 'border-box', fontSize: '12px', padding: '4px 6px', marginBottom: '10px' },
+                }),
+                createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+                  createElement('button', { type: 'button', onClick: () => setMigrateTarget(null) }, '取消'),
+                  createElement('button', {
+                    type: 'button',
+                    onClick: () => {
+                      const t = migrateTarget
+                      const p = migratePreset.trim()
+                      if (!t) return
+                      if (!p) { setNotice('目标预设不能为空'); return }
+                      setMigrateTarget(null)
+                      onMigrate(t.sessionId, p)
+                    },
+                  }, '确认')
+                )
+              )
+            )
+          : null
       )
     )
   ), document.body)
