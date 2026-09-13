@@ -269,7 +269,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }, [tab])
 
   useEffect(() => {
-    if (!selected) { setRounds([]); return }
+    if (!selected) { setRounds([]); setLoading(false); return }
     setLoading(true)
     callApi('list-rounds', { sessionId: selected.sessionId }).then((res: any) => {
       setRounds(res.ok ? res.items : [])
@@ -297,6 +297,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     setTab(next)
     setSelected(null)
     setRounds([])
+    setLoading(false)
   }
 
   const tabBtn = (id: 'active' | 'archived', label: string) =>
@@ -354,6 +355,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     className: `ssb_sessionItem${selected?.sessionId === s.sessionId ? ' ssb_sessionItemActive' : ''}`,
                     onClick: () => {
                       setSelected(s)
+                      if (s.archived) return
                       // Expand collapsed workspace group before opening
                       try {
                         if (s.cwd) {
