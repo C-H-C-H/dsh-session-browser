@@ -14,6 +14,7 @@ interface SessionItem {
   cwd: string
   createdAt: number
   updatedAt: number
+  archived: boolean
 }
 
 interface RoundItem {
@@ -239,13 +240,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [selected, setSelected] = useState<SessionItem | null>(null)
   const [rounds, setRounds] = useState<RoundItem[]>([])
   const [filter, setFilter] = useState('')
+  const [tab, setTab] = useState<'active' | 'archived'>('active')
   const [loading, setLoading] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
   useEffect(() => {
-    callApi('list-sessions', {}).then((res: any) => {
+    callApi('list-sessions', { archived: tab === 'archived' }).then((res: any) => {
       if (!res.ok) return
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
@@ -264,7 +266,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       })
       setSessions(merged)
     })
-  }, [])
+  }, [tab])
 
   useEffect(() => {
     if (!selected) { setRounds([]); return }
@@ -291,11 +293,45 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     top: `${Math.max(8, Math.min((window.innerHeight - 480) / 2, window.innerHeight - 488))}px`,
   }
 
+  const switchTab = (next: 'active' | 'archived') => {
+    setTab(next)
+    setSelected(null)
+    setRounds([])
+  }
+
+  const tabBtn = (id: 'active' | 'archived', label: string) =>
+    createElement('button', {
+      key: id,
+      type: 'button',
+      role: 'tab',
+      'aria-selected': tab === id,
+      onClick: () => switchTab(id),
+      style: {
+        border: 'none',
+        background: tab === id ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+        color: tab === id ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+        fontWeight: tab === id ? 600 : 400,
+        fontSize: '12px',
+        lineHeight: '18px',
+        padding: '2px 10px',
+        borderRadius: '6px',
+        cursor: 'pointer',
+      },
+    }, label)
+
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
     createElement('div', { key: 'panel', className: 'ssb_panel', style: panelStyle, role: 'dialog', 'aria-label': '会话浏览' },
       createElement('div', { key: 'header', className: 'ssb_header' },
-        createElement('span', { className: 'ssb_headerTitle' }, '会话浏览'),
+        createElement('div', { key: 'titleGroup', style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
+          createElement('span', { className: 'ssb_headerTitle' }, '会话浏览'),
+          createElement('div', {
+            key: 'tabs',
+            role: 'tablist',
+            'aria-label': '归档筛选',
+            style: { display: 'inline-flex', gap: '2px', padding: '2px', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px' },
+          }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档')])
+        ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
       ),
       createElement('div', { key: 'body', className: 'ssb_body' },
@@ -347,6 +383,12 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           selected
             ? createElement('div', { className: 'ssb_roundTitle' }, selected.title || '(未命名)')
             : createElement('div', { className: 'ssb_roundTitle' }, '选择一个会话'),
+          selected?.archived
+            ? createElement('div', {
+                key: 'archivedNote',
+                style: { flex: 'none', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)', padding: '6px 12px 2px' },
+              }, '已归档会话仅浏览，不跳转')
+            : null,
           createElement('div', { className: 'ssb_scroll' },
             loading
               ? createElement('div', { className: 'ssb_status' }, '加载中…')
@@ -354,16 +396,15 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                 ? createElement('div', { className: 'ssb_empty' }, '← 点击左侧会话查看轮次')
                 : rounds.length === 0
                   ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
-                  : rounds.map(r =>
-                      createElement('div', {
-                        key: r.seq,
-                        className: 'ssb_roundItem',
-                        onClick: () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId),
-                      },
+                  : rounds.map(r => {
+                      const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
+                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId)
+                      else itemProps.style = { cursor: 'default' }
+                      return createElement('div', itemProps,
                         createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
                         createElement('div', { className: 'ssb_roundMeta' }, fmtTime(r.time))
                       )
-                    )
+                    })
           )
         )
       )
