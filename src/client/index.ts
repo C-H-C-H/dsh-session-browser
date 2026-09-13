@@ -14,6 +14,7 @@ interface SessionItem {
   cwd: string
   createdAt: number
   updatedAt: number
+  archived: boolean
 }
 
 interface RoundItem {
@@ -167,6 +168,90 @@ function expandAllSessionOverflows() {
   } catch { /* ignore */ }
 }
 
+/** ------------------------------------------------------------------ Task 5: row actions.
+ * Read of the currently-open session id. Primary is the production shape
+ * `ctx.sessions.list.getSnapshot().current` (SessionListSnapshot.current:
+ * SessionId|undefined, plain string); the older accessor shapes are kept only
+ * as best-effort fallback for host-version variance; unknown shapes yield
+ * undefined (callers treat that as "not current").
+ */
+function currentOpenSessionId(ctx: Context): string | undefined {
+  try {
+    const svc = (ctx as any).sessions
+    if (!svc) return undefined
+    // Production primary: list snapshot .current is the plain SessionId string
+    // (SessionListSnapshot.current: SessionId|undefined).
+    try {
+      const snapCur = svc?.list?.getSnapshot?.()?.current
+      if (typeof snapCur === 'string' && snapCur !== '') return snapCur
+    } catch { /* ignore */ }
+    const fields = [svc.currentSessionId, svc.currentId, svc.current]
+    for (const f of fields) {
+      if (typeof f === 'string' && f !== '') return f
+      if (f && typeof f === 'object') {
+        if (typeof f.sessionId === 'string' && f.sessionId !== '') return f.sessionId
+        if (typeof f.id === 'string' && f.id !== '') return f.id
+      }
+    }
+    if (typeof svc.getCurrent === 'function') {
+      const cur = svc.getCurrent()
+      if (typeof cur === 'string' && cur !== '') return cur
+      if (cur && typeof cur === 'object') {
+        if (typeof cur.sessionId === 'string' && cur.sessionId !== '') return cur.sessionId
+        if (typeof cur.id === 'string' && cur.id !== '') return cur.id
+      }
+    }
+  } catch { /* ignore */ }
+  return undefined
+}
+
+function sessionsStoreById(ctx: Context): Record<string, any> {
+  try {
+    const snap = (ctx as any).sessions?.list?.getSnapshot?.()
+    if (snap && typeof snap.byId === 'object' && snap.byId !== null) return snap.byId
+  } catch { /* ignore */ }
+  return {}
+}
+
+function refreshSessionsStore(ctx: Context): Promise<unknown> {
+  try {
+    const p = (ctx as any).sessions?.refresh?.()
+    if (p && typeof p.then === 'function') return p.catch(() => undefined)
+  } catch { /* ignore */ }
+  return Promise.resolve(undefined)
+}
+
+function refreshWorkspacesStore(ctx: Context): Promise<unknown> {
+  try {
+    const svc = (ctx as any).workspaces ?? (ctx as any).get?.('workspaces')
+    const p = svc?.refresh?.()
+    if (p && typeof p.then === 'function') return p.catch(() => undefined)
+  } catch { /* ignore */ }
+  return Promise.resolve(undefined)
+}
+
+function apiError(res: any, fallback: string): string {
+  return (res && typeof res.error === 'string' && res.error !== '') ? res.error : fallback
+}
+
+function mapWorkspaceList(list: unknown): Array<{ id: string; name?: string; title?: string; path?: string }> {
+  if (!Array.isArray(list)) return []
+  return (list as any[])
+    .map((w: any) => ({ id: String(w.id ?? w.workspaceId ?? ''), name: w.name, title: w.title, path: w.path }))
+    .filter((w: { id: string }) => w.id !== '')
+}
+
+// Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
+// reopen-if-current. Shared by the Panel row action (Task 5) and the header
+// action (Task 6); each caller schedules the 250/900ms delayed legs itself
+// (Task 3 record).
+async function refreshMovedSession(ctx: Context, sessionId: string, wasCurrent: boolean): Promise<void> {
+  try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  if (wasCurrent) {
+    try { if (sessionsStoreById(ctx)[sessionId] !== undefined) (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+  }
+}
+
 function browseIcon(): ReturnType<typeof createElement> {
   return createElement('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true },
     createElement('rect', { x: 2, y: 2, width: 12, height: 12, rx: 2, stroke: 'currentColor', strokeWidth: 1.5 }),
@@ -239,14 +324,22 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [selected, setSelected] = useState<SessionItem | null>(null)
   const [rounds, setRounds] = useState<RoundItem[]>([])
   const [filter, setFilter] = useState('')
+  const [tab, setTab] = useState<'active' | 'archived'>('active')
   const [loading, setLoading] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [noticeOk, setNoticeOk] = useState(false)
+  const [moveTarget, setMoveTarget] = useState<SessionItem | null>(null)
+  const [moveWs, setMoveWs] = useState('')
+  const [wsList, setWsList] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
+  const [migrateTarget, setMigrateTarget] = useState<SessionItem | null>(null)
+  const [migratePreset, setMigratePreset] = useState('')
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
-  useEffect(() => {
-    callApi('list-sessions', {}).then((res: any) => {
-      if (!res.ok) return
+  const reloadSessions = (forTab: 'active' | 'archived') => {
+    callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
+      if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
       let liveById: Record<string, any> = {}
@@ -264,10 +357,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       })
       setSessions(merged)
     })
-  }, [])
+  }
 
   useEffect(() => {
-    if (!selected) { setRounds([]); return }
+    reloadSessions(tab)
+  }, [tab])
+
+  useEffect(() => {
+    if (!selected) { setRounds([]); setLoading(false); return }
     setLoading(true)
     callApi('list-rounds', { sessionId: selected.sessionId }).then((res: any) => {
       setRounds(res.ok ? res.items : [])
@@ -291,13 +388,170 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     top: `${Math.max(8, Math.min((window.innerHeight - 480) / 2, window.innerHeight - 488))}px`,
   }
 
+  const switchTab = (next: 'active' | 'archived') => {
+    setTab(next)
+    setSelected(null)
+    setRounds([])
+    setLoading(false)
+    setNotice(''); setNoticeOk(false)
+  }
+
+  const onMove = async (sessionId: string, targetWorkspaceId: string): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const wasCurrent = currentOpenSessionId(ctx) === sessionId
+    const res: any = await callApi('move', { sessionId, targetWorkspaceId })
+    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); setNoticeOk(false); return }
+    setNotice('移动成功'); setNoticeOk(true)
+    reloadSessions(tab)
+    await refreshMovedSession(ctx, sessionId, wasCurrent)
+    setTimeout(() => { refreshMovedSession(ctx, sessionId, wasCurrent) }, 250)
+    setTimeout(() => { refreshMovedSession(ctx, sessionId, wasCurrent) }, 900)
+  }
+
+  const onArchive = async (s: SessionItem): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const res: any = await callApi('archive', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '归档失败')); setNoticeOk(false); return }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onUnarchive = async (s: SessionItem): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const res: any = await callApi('unarchive', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '移出归档失败')); setNoticeOk(false); return }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onRemove = async (s: SessionItem): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const wasCurrent = currentOpenSessionId(ctx) === s.sessionId
+    const res: any = await callApi('delete', { sessionId: s.sessionId })
+    if (!res?.ok) { setNotice(apiError(res, '删除会话失败')); setNoticeOk(false); return }
+    // Same rule as session-manager: deleting the open session clears it so the
+    // main UI does not show a removed session.
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+    }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onMigrate = async (sessionId: string, toPreset: string): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const wasCurrent = currentOpenSessionId(ctx) === sessionId
+    const res: any = await callApi('preset-migrate', { sessionId, toPreset })
+    if (!res?.ok) { setNotice(apiError(res, '迁移预设失败')); setNoticeOk(false); return }
+    setNotice('迁移成功'); setNoticeOk(true)
+    try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
+    try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+    }
+    reloadSessions(tab)
+    // Single 250ms delayed baseline (no 900ms leg — Task 3 record).
+    setTimeout(() => {
+      refreshSessionsStore(ctx).then(() => {
+        try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
+        if (wasCurrent) {
+          try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+        }
+      })
+    }, 250)
+  }
+
+  const openMoveDialog = (s: SessionItem) => {
+    setNotice(''); setNoticeOk(false)
+    setMigrateTarget(null)
+    setMoveTarget(s)
+    setMoveWs('')
+    setWsList([])
+    callApi('workspaces', {}).then((res: any) => {
+      const list = res?.ok ? res?.result?.workspaces : undefined
+      if (!res?.ok || !Array.isArray(list)) { setNotice(apiError(res, '加载工作区列表失败')); setNoticeOk(false); return }
+      const mapped = mapWorkspaceList(list)
+      setWsList(mapped)
+      if (mapped.length > 0) setMoveWs(mapped[0].id)
+    })
+  }
+
+  const openMigrateDialog = (s: SessionItem) => {
+    setNotice(''); setNoticeOk(false)
+    setMoveTarget(null)
+    setMigrateTarget(s)
+    setMigratePreset('')
+  }
+
+  const rowBtn = (label: string, s: SessionItem, onPress: (row: SessionItem) => void) =>
+    createElement('button', {
+      key: label,
+      type: 'button',
+      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } onPress(s) },
+      style: {
+        border: '1px solid var(--dsw-alias-border-l2)',
+        background: 'transparent',
+        color: 'var(--dsw-alias-label-secondary)',
+        fontSize: '11px',
+        lineHeight: '16px',
+        padding: '1px 8px',
+        borderRadius: '6px',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      },
+    }, label)
+
+  const tabBtn = (id: 'active' | 'archived', label: string) =>
+    createElement('button', {
+      key: id,
+      type: 'button',
+      role: 'tab',
+      'aria-selected': tab === id,
+      onClick: () => switchTab(id),
+      style: {
+        border: 'none',
+        background: tab === id ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+        color: tab === id ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+        fontWeight: tab === id ? 600 : 400,
+        fontSize: '12px',
+        lineHeight: '18px',
+        padding: '2px 10px',
+        borderRadius: '6px',
+        cursor: 'pointer',
+      },
+    }, label)
+
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
     createElement('div', { key: 'panel', className: 'ssb_panel', style: panelStyle, role: 'dialog', 'aria-label': '会话浏览' },
       createElement('div', { key: 'header', className: 'ssb_header' },
-        createElement('span', { className: 'ssb_headerTitle' }, '会话浏览'),
+        createElement('div', { key: 'titleGroup', style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
+          createElement('span', { className: 'ssb_headerTitle' }, '会话浏览'),
+          createElement('div', {
+            key: 'tabs',
+            role: 'tablist',
+            'aria-label': '归档筛选',
+            style: { display: 'inline-flex', gap: '2px', padding: '2px', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px' },
+          }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档')])
+        ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
       ),
+      notice
+        ? createElement('div', {
+            key: 'notice',
+            style: {
+              flex: 'none',
+              fontSize: '11px',
+              lineHeight: '16px',
+              color: noticeOk ? 'var(--dsw-alias-state-success, #1a7f37)' : 'var(--dsw-alias-state-danger, #c53b3b)',
+              padding: '6px 12px',
+              borderBottom: '1px solid var(--dsw-alias-border-l2)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            },
+          }, notice)
+        : null,
       createElement('div', { key: 'body', className: 'ssb_body' },
         // Left: session list
         createElement('div', { key: 'sessions', className: 'ssb_sessionList' },
@@ -318,6 +572,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     className: `ssb_sessionItem${selected?.sessionId === s.sessionId ? ' ssb_sessionItemActive' : ''}`,
                     onClick: () => {
                       setSelected(s)
+                      if (s.archived) return
                       // Expand collapsed workspace group before opening
                       try {
                         if (s.cwd) {
@@ -337,7 +592,17 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     },
                   },
                     createElement('div', { className: 'ssb_sessionTitle' }, s.title || '(未命名)'),
-                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt))
+                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt)),
+                    createElement('div', {
+                      key: 'actions',
+                      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+                      style: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '4px' },
+                    },
+                      s.archived ? rowBtn('移出归档', s, onUnarchive) : rowBtn('归档', s, onArchive),
+                      rowBtn('删除', s, onRemove),
+                      rowBtn('移动', s, openMoveDialog),
+                      rowBtn('迁移', s, openMigrateDialog)
+                    )
                   )
                 )
           )
@@ -347,6 +612,12 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           selected
             ? createElement('div', { className: 'ssb_roundTitle' }, selected.title || '(未命名)')
             : createElement('div', { className: 'ssb_roundTitle' }, '选择一个会话'),
+          selected?.archived
+            ? createElement('div', {
+                key: 'archivedNote',
+                style: { flex: 'none', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)', padding: '6px 12px 2px' },
+              }, '已归档会话仅浏览，不跳转')
+            : null,
           createElement('div', { className: 'ssb_scroll' },
             loading
               ? createElement('div', { className: 'ssb_status' }, '加载中…')
@@ -354,18 +625,103 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                 ? createElement('div', { className: 'ssb_empty' }, '← 点击左侧会话查看轮次')
                 : rounds.length === 0
                   ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
-                  : rounds.map(r =>
-                      createElement('div', {
-                        key: r.seq,
-                        className: 'ssb_roundItem',
-                        onClick: () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId),
-                      },
+                  : rounds.map(r => {
+                      const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
+                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId)
+                      else itemProps.style = { cursor: 'default' }
+                      return createElement('div', itemProps,
                         createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
                         createElement('div', { className: 'ssb_roundMeta' }, fmtTime(r.time))
                       )
-                    )
+                    })
           )
-        )
+        ),
+        moveTarget
+          ? createElement('div', {
+              key: 'moveDlg',
+              onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+              style: {
+                position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(0,0,0,0.25)', zIndex: 1,
+              },
+            },
+              createElement('div', {
+                style: {
+                  width: '300px', maxWidth: 'calc(100% - 32px)', background: 'var(--dsw-specific-tip)',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '10px', padding: '12px',
+                  boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+                },
+              },
+                createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, '移动会话'),
+                createElement('div', {
+                  style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                }, moveTarget.title || '(未命名)'),
+                createElement('select', {
+                  value: moveWs,
+                  onChange: (e: any) => setMoveWs(e.target.value),
+                  style: { width: '100%', fontSize: '12px', padding: '4px 6px', marginBottom: '10px' },
+                }, wsList.map(w => createElement('option', { key: w.id, value: w.id }, w.title || w.name || w.path || w.id))),
+                createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+                  createElement('button', { type: 'button', onClick: () => setMoveTarget(null) }, '取消'),
+                  createElement('button', {
+                    type: 'button',
+                    onClick: () => {
+                      const t = moveTarget
+                      const ws = moveWs
+                      if (!t) return
+                      if (!ws) { setNotice('请选择目标工作区'); setNoticeOk(false); return }
+                      setMoveTarget(null)
+                      onMove(t.sessionId, ws)
+                    },
+                  }, '确认')
+                )
+              )
+            )
+          : null,
+        migrateTarget
+          ? createElement('div', {
+              key: 'migrateDlg',
+              onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
+              style: {
+                position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(0,0,0,0.25)', zIndex: 1,
+              },
+            },
+              createElement('div', {
+                style: {
+                  width: '300px', maxWidth: 'calc(100% - 32px)', background: 'var(--dsw-specific-tip)',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '10px', padding: '12px',
+                  boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+                },
+              },
+                createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, '迁移预设'),
+                createElement('div', {
+                  style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                }, migrateTarget.title || '(未命名)'),
+                createElement('input', {
+                  type: 'text',
+                  placeholder: '目标预设',
+                  value: migratePreset,
+                  onChange: (e: any) => setMigratePreset(e.target.value),
+                  style: { width: '100%', boxSizing: 'border-box', fontSize: '12px', padding: '4px 6px', marginBottom: '10px' },
+                }),
+                createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+                  createElement('button', { type: 'button', onClick: () => setMigrateTarget(null) }, '取消'),
+                  createElement('button', {
+                    type: 'button',
+                    onClick: () => {
+                      const t = migrateTarget
+                      const p = migratePreset.trim()
+                      if (!t) return
+                      if (!p) { setNotice('目标预设不能为空'); setNoticeOk(false); return }
+                      setMigrateTarget(null)
+                      onMigrate(t.sessionId, p)
+                    },
+                  }, '确认')
+                )
+              )
+            )
+          : null
       )
     )
   ), document.body)
@@ -389,6 +745,344 @@ function SidebarButton({ ctx }: { ctx: Context }) {
   )
 }
 
+/** ------------------------------------------------------------------ Task 6: header actions.
+ * Port of dsh-session-manager HeaderAction (+ ConfirmDialog + MoveDialog) with
+ * ZERO behavior change. Deliberate adaptations, all per brief:
+ * - NO locale service: the Chinese copy below is the old session-manager zh
+ *   dictionary verbatim (归档/移出归档/移动至工作区/删除会话/删除会话…不可撤销/
+ *   移动会话到工作区…/没有可移动到的其他工作区/选择目标工作区/确认删除/
+ *   确认移动/取消/操作失败：{message}).
+ * - API base is this plugin's callApi ('archive' / 'unarchive' / 'delete' /
+ *   'move' / 'workspaces' routes) instead of session-manager's paths.
+ * - Archived state comes from `list-sessions { archived: true }` (this client
+ *   has no useWorkspaces hook; inject stays ['slots', 'sessions'], workspaces
+ *   is reached lazily only for refresh, like listClientWorkspaceItems).
+ * - Dialogs render via createPortal + inline styles (CSS block untouched).
+ */
+
+interface HeaderAnchor { top: number; left: number }
+
+function headerAnchorFor(el: any): HeaderAnchor | null {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return null
+  const r = el.getBoundingClientRect()
+  return {
+    top: Math.round(r.top + r.height + 6),
+    left: Math.max(8, Math.round(r.right - 320)),
+  }
+}
+
+function headerCardStyle(anchor: HeaderAnchor | null): Record<string, string> {
+  const base: Record<string, string> = {
+    width: '300px',
+    maxWidth: 'calc(100vw - 32px)',
+    background: 'var(--dsw-specific-tip)',
+    border: '1px solid var(--dsw-alias-border-l2)',
+    borderRadius: '10px',
+    padding: '12px',
+    boxShadow: '0 8px 28px rgba(0,0,0,.16)',
+  }
+  if (anchor) {
+    base.position = 'fixed'
+    base.top = `${anchor.top}px`
+    base.left = `${anchor.left}px`
+    base.zIndex = '2147483001'
+  }
+  return base
+}
+
+function HeaderConfirmDialog({ open, title, description, confirmLabel, cancelLabel, anchor, onCancel, onConfirm }: {
+  open: boolean; title: string; description: string; confirmLabel: string; cancelLabel: string
+  anchor: HeaderAnchor | null; onCancel: () => void; onConfirm: () => void
+}) {
+  if (!open) return null
+  const centered = anchor === null
+  return createPortal(createElement('div', {
+    role: 'presentation',
+    tabIndex: -1,
+    onKeyDown: (e: any) => {
+      if (e.key === 'Escape') { e.preventDefault(); onCancel() }
+      else if (e.key === 'Enter') { e.preventDefault(); onConfirm() }
+    },
+    style: centered
+      ? { position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.25)', zIndex: 2147483001 }
+      : { position: 'fixed', inset: 0, zIndex: 2147483001, background: 'transparent' },
+  },
+    centered ? null : createElement('div', {
+      onMouseDown: (e: any) => { if (e.target === e.currentTarget) onCancel() },
+      style: { position: 'fixed', inset: 0, background: 'transparent' },
+    }),
+    createElement('section', {
+      role: 'dialog', 'aria-modal': 'true',
+      ref: (el: any) => { if (el && typeof el.focus === 'function') el.focus() },
+      style: headerCardStyle(anchor),
+    },
+      createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, title),
+      description
+        ? createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '10px', wordBreak: 'break-word' } }, description)
+        : null,
+      createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+        createElement('button', { type: 'button', onClick: onCancel }, cancelLabel),
+        createElement('button', { type: 'button', onClick: onConfirm }, confirmLabel)
+      )
+    )
+  ), document.body)
+}
+
+function HeaderMoveDialog({ open, title, description, workspaces, currentWorkspaceId, confirmLabel, cancelLabel, anchor, onCancel, onConfirm }: {
+  open: boolean; title: string; description: string
+  workspaces: Array<{ id: string; name?: string; title?: string; path?: string }>
+  currentWorkspaceId: string; confirmLabel: string; cancelLabel: string
+  anchor: HeaderAnchor | null; onCancel: () => void; onConfirm: (targetWorkspaceId: string) => void
+}) {
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('')
+  if (!open) return null
+  const list = (Array.isArray(workspaces) ? workspaces : [])
+    .filter((ws) => ws && typeof ws === 'object' && typeof ws.id === 'string' && ws.id !== currentWorkspaceId)
+  const centered = anchor === null
+  return createPortal(createElement('div', {
+    role: 'presentation',
+    tabIndex: -1,
+    onKeyDown: (e: any) => {
+      if (e.key === 'Escape') { e.preventDefault(); onCancel() }
+      else if (e.key === 'Enter' && selectedWorkspaceId !== '' && list.length > 0) { e.preventDefault(); onConfirm(selectedWorkspaceId) }
+    },
+    style: centered
+      ? { position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.25)', zIndex: 2147483001 }
+      : { position: 'fixed', inset: 0, zIndex: 2147483001, background: 'transparent' },
+  },
+    centered ? null : createElement('div', {
+      onMouseDown: (e: any) => { if (e.target === e.currentTarget) onCancel() },
+      style: { position: 'fixed', inset: 0, background: 'transparent' },
+    }),
+    createElement('section', {
+      role: 'dialog', 'aria-modal': 'true',
+      ref: (el: any) => { if (el && typeof el.focus === 'function') el.focus() },
+      style: headerCardStyle(anchor),
+    },
+      createElement('div', { style: { fontSize: '13px', fontWeight: 600, marginBottom: '4px' } }, title),
+      createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '8px', wordBreak: 'break-word' } }, description),
+      list.length === 0
+        ? createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '10px' } }, '没有可移动到的其他工作区。')
+        : createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '10px' } },
+            createElement('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } }, '选择目标工作区'),
+            createElement('div', { role: 'listbox', 'aria-label': '选择目标工作区', style: { display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '200px', overflow: 'auto' } },
+              list.map((ws) => createElement('button', {
+                key: ws.id,
+                type: 'button',
+                role: 'option',
+                'aria-selected': selectedWorkspaceId === ws.id,
+                onClick: () => setSelectedWorkspaceId(ws.id),
+                style: {
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '8px 12px', cursor: 'pointer', textAlign: 'left',
+                  border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px',
+                  background: selectedWorkspaceId === ws.id ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+                  borderColor: selectedWorkspaceId === ws.id ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-border-l2)',
+                },
+              },
+                createElement('span', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-primary)' } }, String(ws.title || ws.name || ws.id)),
+                createElement('span', { style: { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' } }, ws.path ? String(ws.path) : '')
+              ))
+            )
+          ),
+      createElement('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+        createElement('button', { type: 'button', onClick: onCancel }, cancelLabel),
+        createElement('button', {
+          type: 'button',
+          disabled: selectedWorkspaceId === '' || list.length === 0,
+          onClick: () => { if (selectedWorkspaceId !== '') onConfirm(selectedWorkspaceId) },
+        }, confirmLabel)
+      )
+    )
+  ), document.body)
+}
+
+function HeaderAction({ ctx, sessionId }: { ctx: Context; sessionId: string }) {
+  const [archived, setArchived] = useState(false)
+  const [confirmFor, setConfirmFor] = useState<{ id: string; displayTitle: string } | null>(null)
+  const [confirmAnchor, setConfirmAnchor] = useState<HeaderAnchor | null>(null)
+  const [moveFor, setMoveFor] = useState<{ id: string; displayTitle: string; workspaceId: string } | null>(null)
+  const [moveAnchor, setMoveAnchor] = useState<HeaderAnchor | null>(null)
+  const [workspaces, setWorkspaces] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
+
+  // Archived state: this client has no useWorkspaces hook, so read the
+  // host-authoritative set via list-sessions (same archivedSessionIds source
+  // the host filters by). Re-read per session + after our own toggles below.
+  useEffect(() => {
+    let alive = true
+    setArchived(false)
+    if (typeof sessionId === 'string' && sessionId !== '') {
+      callApi('list-sessions', { archived: true }).then((res: any) => {
+        if (!alive) return
+        const items = res?.ok ? res?.items : undefined
+        if (Array.isArray(items) && items.some((i: any) => i?.sessionId === sessionId)) setArchived(true)
+      })
+    }
+    return () => { alive = false }
+  }, [sessionId])
+
+  // Mirror of the session-manager HeaderAction workspaces effect (route adapted).
+  useEffect(() => {
+    if (!moveFor) { setWorkspaces([]); return }
+    let alive = true
+    callApi('workspaces', {}).then((res: any) => {
+      if (!alive) return
+      if (res?.ok) setWorkspaces(mapWorkspaceList(res?.result?.workspaces))
+    })
+    return () => { alive = false }
+  }, [moveFor ? moveFor.id : null])
+
+  // Mirror of session-manager runWithAlert: errors surface via window.alert
+  // with the hardcoded Chinese template (host error strings only, no secrets).
+  const runWithAlert = (fn: () => Promise<unknown>): Promise<void> => {
+    return Promise.resolve()
+      .then(() => fn())
+      .catch((e) => {
+        try {
+          const msg = e instanceof Error ? e.message : String(e)
+          window.alert('操作失败：{message}'.replace('{message}', msg))
+        } catch { /* ignore */ }
+      })
+  }
+
+  const doArchive = (): Promise<void> => runWithAlert(async () => {
+    const res: any = await callApi('archive', { sessionId })
+    if (!res?.ok) throw new Error(apiError(res, '归档失败'))
+    setArchived(true)
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  })
+
+  const doUnarchive = (): Promise<void> => runWithAlert(async () => {
+    const res: any = await callApi('unarchive', { sessionId })
+    if (!res?.ok) throw new Error(apiError(res, '移出归档失败'))
+    setArchived(false)
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  })
+
+  const doRemove = (id: string): Promise<void> => runWithAlert(async () => {
+    const wasCurrent = currentOpenSessionId(ctx) === id
+    const res: any = await callApi('delete', { sessionId: id })
+    if (!res?.ok) throw new Error(apiError(res, '删除会话失败'))
+    // Same rule as session-manager: deleting the open session clears it so the
+    // main UI does not show a removed session.
+    if (wasCurrent) {
+      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+    }
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
+  })
+
+  const doMove = (id: string, targetWorkspaceId: string): Promise<void> => runWithAlert(async () => {
+    const wasCurrent = currentOpenSessionId(ctx) === id
+    const res: any = await callApi('move', { sessionId: id, targetWorkspaceId })
+    if (!res?.ok) throw new Error(apiError(res, '移动会话失败'))
+    await refreshMovedSession(ctx, id, wasCurrent)
+    setTimeout(() => { refreshMovedSession(ctx, id, wasCurrent) }, 250)
+    setTimeout(() => { refreshMovedSession(ctx, id, wasCurrent) }, 900)
+  })
+
+  if (typeof sessionId !== 'string' || sessionId === '') return null
+
+  const headerBtn = (label: string, active: boolean, props: Record<string, any>) =>
+    createElement('button', {
+      type: 'button',
+      'aria-label': label,
+      ...props,
+      style: {
+        boxSizing: 'border-box',
+        minHeight: '28px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+        padding: '3px 10px',
+        fontSize: '12px',
+        lineHeight: '18px',
+        whiteSpace: 'nowrap',
+        color: 'var(--dsw-alias-label-secondary)',
+        background: active ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '999px',
+        cursor: 'pointer',
+      },
+    }, label)
+
+  return createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+    headerBtn(archived ? '移出归档' : '归档', archived, {
+      key: 'archive',
+      onClick: () => { if (archived) void doUnarchive(); else void doArchive() },
+    }),
+    headerBtn('移动至工作区', moveFor !== null, {
+      key: 'move',
+      onClick: (e: any) => {
+        try { e.stopPropagation() } catch { /* ignore */ }
+        setConfirmFor(null)
+        setConfirmAnchor(null)
+        if (moveFor && moveFor.id === sessionId) {
+          setMoveFor(null)
+          setMoveAnchor(null)
+        } else {
+          setMoveAnchor(headerAnchorFor(e.currentTarget))
+          setMoveFor({ id: sessionId, displayTitle: sessionId, workspaceId: '' })
+        }
+      },
+    }),
+    headerBtn('删除会话', confirmFor !== null, {
+      key: 'delete',
+      onClick: (e: any) => {
+        try { e.stopPropagation() } catch { /* ignore */ }
+        setMoveFor(null)
+        setMoveAnchor(null)
+        if (confirmFor && confirmFor.id === sessionId) {
+          setConfirmFor(null)
+          setConfirmAnchor(null)
+        } else {
+          setConfirmAnchor(headerAnchorFor(e.currentTarget))
+          setConfirmFor({ id: sessionId, displayTitle: sessionId })
+        }
+      },
+    }),
+    confirmFor
+      ? createElement(HeaderConfirmDialog, {
+          key: 'deleteConfirm',
+          open: true,
+          anchor: confirmAnchor,
+          onCancel: () => { setConfirmFor(null); setConfirmAnchor(null) },
+          onConfirm: () => {
+            const target = confirmFor
+            setConfirmFor(null)
+            setConfirmAnchor(null)
+            void doRemove(target.id)
+          },
+          title: '删除会话',
+          description: '会话「{title}」将被永久删除，包括其全部消息记录与磁盘文件，此操作不可撤销。'
+            .replace('{title}', confirmFor.displayTitle || confirmFor.id),
+          confirmLabel: '确认删除',
+          cancelLabel: '取消',
+        })
+      : null,
+    moveFor
+      ? createElement(HeaderMoveDialog, {
+          key: 'moveDialog',
+          open: true,
+          anchor: moveAnchor,
+          workspaces,
+          currentWorkspaceId: moveFor.workspaceId || '',
+          onCancel: () => { setMoveFor(null); setMoveAnchor(null) },
+          onConfirm: (targetWorkspaceId: string) => {
+            const target = moveFor
+            setMoveFor(null)
+            setMoveAnchor(null)
+            void doMove(target.id, targetWorkspaceId)
+          },
+          title: '移动会话到工作区',
+          description: '将会话「{title}」移动到目标工作区。'
+            .replace('{title}', moveFor.displayTitle || moveFor.id),
+          confirmLabel: '确认移动',
+          cancelLabel: '取消',
+        })
+      : null
+  )
+}
+
 /** ------------------------------------------------------------------ plugin */
 
 export const inject = ['slots', 'sessions']
@@ -400,5 +1094,9 @@ export function apply(ctx: Context) {
   slots.inject('sidebar.footer.action', () => slots.register(
     { name: 'sidebar.footer.action', id: 'dsh-session-browser', order: 20 },
     () => createElement(SidebarButton, { ctx })
+  ))
+  slots.inject('conversation.session.header.actions', () => slots.register(
+    { name: 'conversation.session.header.actions', id: 'session-manager-header', order: 40 },
+    (slotProps: any) => createElement(HeaderAction, { ctx, sessionId: slotProps?.sessionId })
   ))
 }
