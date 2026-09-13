@@ -968,6 +968,7 @@ function HeaderAction({ ctx, sessionId }: { ctx: Context; sessionId: string }) {
     if (wasCurrent) {
       try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
     }
+    try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
   })
 
   const doMove = (id: string, targetWorkspaceId: string): Promise<void> => runWithAlert(async () => {
