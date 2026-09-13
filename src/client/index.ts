@@ -169,16 +169,22 @@ function expandAllSessionOverflows() {
 }
 
 /** ------------------------------------------------------------------ Task 5: row actions.
- * Best-effort read of the currently-open session id. The sessions service
- * shape is host-version dependent, so several accessor shapes are tried;
- * unknown shapes yield undefined (callers treat that as "not current").
- * Recorded here because dsh-session-manager's client source is unavailable;
- * only the behavior contract (reopen-if-current / clear-if-current) is ported.
+ * Read of the currently-open session id. Primary is the production shape
+ * `ctx.sessions.list.getSnapshot().current` (SessionListSnapshot.current:
+ * SessionId|undefined, plain string); the older accessor shapes are kept only
+ * as best-effort fallback for host-version variance; unknown shapes yield
+ * undefined (callers treat that as "not current").
  */
 function currentOpenSessionId(ctx: Context): string | undefined {
   try {
     const svc = (ctx as any).sessions
     if (!svc) return undefined
+    // Production primary: list snapshot .current is the plain SessionId string
+    // (SessionListSnapshot.current: SessionId|undefined).
+    try {
+      const snapCur = svc?.list?.getSnapshot?.()?.current
+      if (typeof snapCur === 'string' && snapCur !== '') return snapCur
+    } catch { /* ignore */ }
     const fields = [svc.currentSessionId, svc.currentId, svc.current]
     for (const f of fields) {
       if (typeof f === 'string' && f !== '') return f
@@ -303,6 +309,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [tab, setTab] = useState<'active' | 'archived'>('active')
   const [loading, setLoading] = useState(false)
   const [notice, setNotice] = useState('')
+  const [noticeOk, setNoticeOk] = useState(false)
   const [moveTarget, setMoveTarget] = useState<SessionItem | null>(null)
   const [moveWs, setMoveWs] = useState('')
   const [wsList, setWsList] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
@@ -314,7 +321,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   const reloadSessions = (forTab: 'active' | 'archived') => {
     callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
-      if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); return }
+      if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
       let liveById: Record<string, any> = {}
@@ -368,7 +375,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     setSelected(null)
     setRounds([])
     setLoading(false)
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
   }
 
   // Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
@@ -381,26 +388,26 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }
 
   const onArchive = async (s: SessionItem): Promise<void> => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     const res: any = await callApi('archive', { sessionId: s.sessionId })
-    if (!res?.ok) { setNotice(apiError(res, '归档失败')); return }
+    if (!res?.ok) { setNotice(apiError(res, '归档失败')); setNoticeOk(false); return }
     if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
     reloadSessions(tab)
   }
 
   const onUnarchive = async (s: SessionItem): Promise<void> => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     const res: any = await callApi('unarchive', { sessionId: s.sessionId })
-    if (!res?.ok) { setNotice(apiError(res, '移出归档失败')); return }
+    if (!res?.ok) { setNotice(apiError(res, '移出归档失败')); setNoticeOk(false); return }
     if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
     reloadSessions(tab)
   }
 
   const onRemove = async (s: SessionItem): Promise<void> => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     const wasCurrent = currentOpenSessionId(ctx) === s.sessionId
     const res: any = await callApi('delete', { sessionId: s.sessionId })
-    if (!res?.ok) { setNotice(apiError(res, '删除会话失败')); return }
+    if (!res?.ok) { setNotice(apiError(res, '删除会话失败')); setNoticeOk(false); return }
     // Same rule as session-manager: deleting the open session clears it so the
     // main UI does not show a removed session.
     if (wasCurrent) {
@@ -411,11 +418,11 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }
 
   const onMove = async (sessionId: string, targetWorkspaceId: string): Promise<void> => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     const wasCurrent = currentOpenSessionId(ctx) === sessionId
     const res: any = await callApi('move', { sessionId, targetWorkspaceId })
-    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); return }
-    setNotice('移动成功')
+    if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); setNoticeOk(false); return }
+    setNotice('移动成功'); setNoticeOk(true)
     reloadSessions(tab)
     await refreshMovedSession(sessionId, wasCurrent)
     setTimeout(() => { refreshMovedSession(sessionId, wasCurrent) }, 250)
@@ -423,11 +430,11 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }
 
   const onMigrate = async (sessionId: string, toPreset: string): Promise<void> => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     const wasCurrent = currentOpenSessionId(ctx) === sessionId
     const res: any = await callApi('preset-migrate', { sessionId, toPreset })
-    if (!res?.ok) { setNotice(apiError(res, '迁移预设失败')); return }
-    setNotice('迁移成功')
+    if (!res?.ok) { setNotice(apiError(res, '迁移预设失败')); setNoticeOk(false); return }
+    setNotice('迁移成功'); setNoticeOk(true)
     try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
     try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
     if (wasCurrent) {
@@ -446,14 +453,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }
 
   const openMoveDialog = (s: SessionItem) => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     setMigrateTarget(null)
     setMoveTarget(s)
     setMoveWs('')
     setWsList([])
     callApi('workspaces', {}).then((res: any) => {
       const list = res?.ok ? res?.result?.workspaces : undefined
-      if (!res?.ok || !Array.isArray(list)) { setNotice(apiError(res, '加载工作区列表失败')); return }
+      if (!res?.ok || !Array.isArray(list)) { setNotice(apiError(res, '加载工作区列表失败')); setNoticeOk(false); return }
       const mapped = list
         .map((w: any) => ({ id: String(w.id ?? w.workspaceId ?? ''), name: w.name, title: w.title, path: w.path }))
         .filter((w: { id: string }) => w.id !== '')
@@ -463,7 +470,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   }
 
   const openMigrateDialog = (s: SessionItem) => {
-    setNotice('')
+    setNotice(''); setNoticeOk(false)
     setMoveTarget(null)
     setMigrateTarget(s)
     setMigratePreset('')
@@ -529,7 +536,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
               flex: 'none',
               fontSize: '11px',
               lineHeight: '16px',
-              color: 'var(--dsw-alias-state-danger, #c53b3b)',
+              color: noticeOk ? 'var(--dsw-alias-state-success, #1a7f37)' : 'var(--dsw-alias-state-danger, #c53b3b)',
               padding: '6px 12px',
               borderBottom: '1px solid var(--dsw-alias-border-l2)',
               overflow: 'hidden',
@@ -655,7 +662,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       const t = moveTarget
                       const ws = moveWs
                       if (!t) return
-                      if (!ws) { setNotice('请选择目标工作区'); return }
+                      if (!ws) { setNotice('请选择目标工作区'); setNoticeOk(false); return }
                       setMoveTarget(null)
                       onMove(t.sessionId, ws)
                     },
@@ -699,7 +706,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       const t = migrateTarget
                       const p = migratePreset.trim()
                       if (!t) return
-                      if (!p) { setNotice('目标预设不能为空'); return }
+                      if (!p) { setNotice('目标预设不能为空'); setNoticeOk(false); return }
                       setMigrateTarget(null)
                       onMigrate(t.sessionId, p)
                     },
