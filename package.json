@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-browser",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "DSH Desktop plugin for browsing sessions with round-level navigation and message jumping",
   "type": "module",
   "main": "lib/index.mjs",

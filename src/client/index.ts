@@ -319,6 +319,35 @@ async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, 
   setTimeout(tryScroll, 600)
 }
 
+/** ------------------------------------------------------------------ Task 3.0.1: resizable list column + toolbar.
+ * Left column width is `listWidth` state (default 220, clamp 160-480),
+ * persisted to localStorage key `ssb-list-width` (try/catch for privacy
+ * modes). A 6px `col-resize` handle between the columns drives window
+ * mousemove/mouseup updates. The toolbar below the header consolidates the
+ * old per-row buttons, all acting on `selected` with the disabled matrix:
+ * no selection -> all disabled; archived -> 归档 disabled / 移出归档 enabled;
+ * unarchived -> 归档 enabled / 移出归档 disabled; 删除/移动/迁移 enabled iff
+ * selected. Dialogs, dual-refresh, and notice states are Task 5's, rewired.
+ */
+
+const LIST_WIDTH_KEY = 'ssb-list-width'
+const LIST_WIDTH_DEFAULT = 220
+const LIST_WIDTH_MIN = 160
+const LIST_WIDTH_MAX = 480
+
+function clampListWidth(w: number): number {
+  if (typeof w !== 'number' || Number.isNaN(w)) return LIST_WIDTH_DEFAULT
+  return Math.max(LIST_WIDTH_MIN, Math.min(LIST_WIDTH_MAX, w))
+}
+
+function readListWidth(): number {
+  try {
+    const raw = localStorage.getItem(LIST_WIDTH_KEY)
+    if (raw === null) return LIST_WIDTH_DEFAULT
+    return clampListWidth(Number(raw))
+  } catch { return LIST_WIDTH_DEFAULT }
+}
+
 function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [sessions, setSessions] = useState<SessionItem[]>([])
   const [selected, setSelected] = useState<SessionItem | null>(null)
@@ -333,6 +362,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [wsList, setWsList] = useState<Array<{ id: string; name?: string; title?: string; path?: string }>>([])
   const [migrateTarget, setMigrateTarget] = useState<SessionItem | null>(null)
   const [migratePreset, setMigratePreset] = useState('')
+  const [listWidth, setListWidth] = useState<number>(readListWidth)
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
@@ -483,11 +513,30 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     setMigratePreset('')
   }
 
-  const rowBtn = (label: string, s: SessionItem, onPress: (row: SessionItem) => void) =>
+  const onColResizeStart = (e: any) => {
+    if (e.button !== 0) return
+    try { e.preventDefault() } catch { /* ignore */ }
+    const startX = e.clientX
+    const startW = listWidth
+    const onMove = (ev: MouseEvent) => {
+      const next = clampListWidth(startW + (ev.clientX - startX))
+      setListWidth(next)
+      try { localStorage.setItem(LIST_WIDTH_KEY, String(next)) } catch { /* ignore */ }
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  const toolBtn = (label: string, disabled: boolean, onPress: () => void) =>
     createElement('button', {
       key: label,
       type: 'button',
-      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } onPress(s) },
+      disabled,
+      onClick: onPress,
       style: {
         border: '1px solid var(--dsw-alias-border-l2)',
         background: 'transparent',
@@ -496,7 +545,8 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
         lineHeight: '16px',
         padding: '1px 8px',
         borderRadius: '6px',
-        cursor: 'pointer',
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.45 : 1,
         whiteSpace: 'nowrap',
       },
     }, label)
@@ -521,6 +571,9 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       },
     }, label)
 
+  const hasSel = selected !== null
+  const selArchived = selected?.archived === true
+
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
     createElement('div', { key: 'panel', className: 'ssb_panel', style: panelStyle, role: 'dialog', 'aria-label': '会话浏览' },
@@ -535,6 +588,23 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档')])
         ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
+      ),
+      createElement('div', {
+        key: 'toolbar',
+        style: {
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: '6px',
+          padding: '6px 12px',
+          borderBottom: '1px solid var(--dsw-alias-border-l2)',
+          flex: 'none',
+        },
+      },
+        toolBtn('归档', !hasSel || selArchived, () => { if (selected) void onArchive(selected) }),
+        toolBtn('移出归档', !hasSel || !selArchived, () => { if (selected) void onUnarchive(selected) }),
+        toolBtn('删除', !hasSel, () => { if (selected) void onRemove(selected) }),
+        toolBtn('移动', !hasSel, () => { if (selected) openMoveDialog(selected) }),
+        toolBtn('迁移', !hasSel, () => { if (selected) openMigrateDialog(selected) })
       ),
       notice
         ? createElement('div', {
@@ -554,7 +624,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
         : null,
       createElement('div', { key: 'body', className: 'ssb_body' },
         // Left: session list
-        createElement('div', { key: 'sessions', className: 'ssb_sessionList' },
+        createElement('div', { key: 'sessions', className: 'ssb_sessionList', style: { width: `${listWidth}px` } },
           createElement('input', {
             ref: inputRef,
             className: 'ssb_search',
@@ -592,21 +662,21 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     },
                   },
                     createElement('div', { className: 'ssb_sessionTitle' }, s.title || '(未命名)'),
-                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt)),
-                    createElement('div', {
-                      key: 'actions',
-                      onClick: (e: any) => { try { e.stopPropagation() } catch { /* ignore */ } },
-                      style: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '4px' },
-                    },
-                      s.archived ? rowBtn('移出归档', s, onUnarchive) : rowBtn('归档', s, onArchive),
-                      rowBtn('删除', s, onRemove),
-                      rowBtn('移动', s, openMoveDialog),
-                      rowBtn('迁移', s, openMigrateDialog)
-                    )
+                    createElement('div', { className: 'ssb_sessionMeta' }, fmtTime(s.updatedAt) || fmtTime(s.createdAt))
                   )
                 )
           )
         ),
+        // Column resize handle (Task 3.0.1): 6px, col-resize, inline style only
+        createElement('div', {
+          key: 'colResize',
+          role: 'separator',
+          'aria-orientation': 'vertical',
+          'aria-label': '调整列表宽度',
+          title: '拖动调整列表宽度',
+          onMouseDown: onColResizeStart,
+          style: { width: '6px', flex: 'none', cursor: 'col-resize' },
+        }),
         // Right: round list
         createElement('div', { key: 'rounds', className: 'ssb_roundList' },
           selected
