@@ -1,18 +1,19 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply, inject } from '../lib/index.mjs';
 
-// Host move / preset-migrate / workspaces（Task 3）：经 apply() 注册的 HTTP handler 测
+// Host move / preset-migrate / workspaces（Task 3/4）：经 apply() 注册的 HTTP handler 测
 // `/session-browser/api/move|preset-migrate|workspaces`（src/index.ts 为 TS 源码，
-// lib/index.mjs 为手写镜像的可运行产物）。move 已重写为 fork 式迁移，只用公开脸：
+// lib/index.mjs 为手写镜像的可运行产物）。move 是 fork 式迁移，只用公开脸：
 // sessionQuery.observeSession 读源会话、agents.create（回退 sessions.create）建新
-// 会话、workspaceRegistry 做记账切换与归档。不再 mock readRaw/loadStored/locate/
-// prepare/enter（旧 move 用的已移除能力）。preset-migrate 仍是旧实现（Task 4 的活），
-// 其用例经 persistence 选项显式传入旧工件 mock。
+// 会话、workspaceRegistry 做记账切换与归档。preset-migrate 是官方语义：只用公开脸
+// agentPresets.list/select（旧 preset 经 composedPreset/agent ctx 读，
+// 回退 sessions.get 的 header）与 agents.get/sessions.get 取 live 对象；不再 mock
+// readRaw/loadStored/locate/prepare/enter（已移除能力）。
 
 function makeEntity(id, dirPath, ids) {
   const record = { sessionIds: [...ids] };
@@ -31,59 +32,12 @@ function makeEntity(id, dirPath, ids) {
   };
 }
 
-// preset-migrate 旧实现（Task 4 重写前）用的工件级 mock：locate 按 meta.cwd
-// 定位，list 以文件存在为准，readRaw 从头行重建 meta。move 新实现不用它。
-function makeLegacyPersistence(entities, files) {
-  const seedDirs = () => [...new Set([
-    ...entities.map((e) => e.path),
-    ...Object.values(files).map((f) => f.cwd),
-  ])];
-  const findArtifact = (id) => {
-    for (const d of seedDirs()) {
-      const p = join(d, id, 'session.jsonl');
-      if (existsSync(p)) return p;
-    }
-    return undefined;
-  };
-  return {
-    locate: (meta) => ({ path: join(meta.cwd, meta.id, 'session.jsonl') }),
-    // 真后端按 id 定位工件（不知 cwd）：扫描已知工作区目录 + 种子 cwd，
-    // meta.cwd 取自磁盘头行（move 后 loadStored 能找到新位置并返回新 cwd）。
-    list: async () => {
-      const out = [];
-      for (const id of Object.keys(files)) {
-        const p = findArtifact(id);
-        if (!p) continue;
-        const header = JSON.parse(readFileSync(p, 'utf8').split('\n')[0]);
-        out.push({ id, cwd: header.cwd, createdAt: 1000 });
-      }
-      return out;
-    },
-    readRaw: async (id) => {
-      const p = findArtifact(id);
-      if (!p) return undefined;
-      const content = readFileSync(p, 'utf8');
-      return { meta: { id, cwd: JSON.parse(content.split('\n')[0]).cwd }, content };
-    },
-    loadStored: async (id) => {
-      const p = findArtifact(id);
-      if (!p) return undefined;
-      const content = readFileSync(p, 'utf8');
-      const nl = content.indexOf('\n');
-      const header = JSON.parse(content.slice(0, nl));
-      const events = content.slice(nl + 1).split('\n')
-        .filter((l) => l.length > 0).map((l) => JSON.parse(l));
-      return { meta: header, events };
-    },
-    inspect: async () => {},
-  };
-}
-
-// 新 move 只用公开脸：sessionQuery.observeSession（源会话读取）、agents.create
-//（首选）/ sessions.create（回退）、sessions.get/flush + agents.get/cancel/whenIdle
-//（live 停止）、workspaceRegistry.list/get/attach/detach/enqueueOperation/
+// 新 move / preset-migrate 只用公开脸：sessionQuery.observeSession（源会话读取）、
+// agents.create（首选）/ sessions.create（回退）、sessions.get/flush +
+// agents.get/cancel/whenIdle（live 对象）、agentPresets.list/select（预设名册与
+// 空白会话切换）、workspaceRegistry.list/get/attach/detach/enqueueOperation/
 // archiveSession（记账切换与旧会话归档）。
-function makeCtx({ entities, presets, observation, observeError, live, noAgentsCreate, persistence }) {
+function makeCtx({ entities, presets, observation, observeError, live, noAgentsCreate, persistence, selectImpl, composedPresetImpl }) {
   const state = { archivedSessionIds: [] };
   const created = [];      // agents.create / sessions.create 调用参数（created[0].meta.cwd 即新会话 cwd）
   const observes = [];     // observeSession 调用记录
@@ -107,6 +61,7 @@ function makeCtx({ entities, presets, observation, observeError, live, noAgentsC
   const liveAgents = new Map(Object.entries(live?.agents || {}));
   const liveSessions = new Map(Object.entries(live?.sessions || {}));
   const emits = [];
+  const selectCalls = []; // agentPresets.select 调用记录（preset-migrate 用）
   const sessionQuery = {
     observeSession: async (id, opts) => {
       observes.push([id, opts]);
@@ -131,7 +86,15 @@ function makeCtx({ entities, presets, observation, observeError, live, noAgentsC
   const services = {
     workspaceRegistry: registry,
     sessionQuery,
-    agentPresets: { list: async () => presets || [] },
+    agentPresets: {
+      list: async () => presets || [],
+      select: async (agent, id) => {
+        selectCalls.push([agent, id]);
+        if (selectImpl) return selectImpl(agent, id);
+        return id;
+      },
+      ...(composedPresetImpl === undefined ? {} : { composedPreset: composedPresetImpl }),
+    },
     ...(persistence === undefined ? {} : { sessionPersistence: persistence }),
   };
   let handler = null;
@@ -162,7 +125,7 @@ function makeCtx({ entities, presets, observation, observeError, live, noAgentsC
   };
   apply(ctx);
   assert.ok(handler, 'apply 应注册 /session-browser/api handler');
-  return { handler, state, entities, emits, created, observes, archiveCalls, flushed, cancelled };
+  return { handler, state, entities, emits, created, observes, archiveCalls, flushed, cancelled, selectCalls };
 }
 
 async function callApi(handler, method, body) {
@@ -184,15 +147,6 @@ async function callApi(handler, method, body) {
 
 async function realDir(prefix) {
   return realpath(mkdtempSync(join(tmpdir(), prefix)));
-}
-
-function writeSession(cwd, id, headerExtra, events) {
-  const dir = join(cwd, id);
-  mkdirSync(dir, { recursive: true });
-  const header = { id, cwd, createdAt: 1000, ...(headerExtra || {}) };
-  const lines = [JSON.stringify(header), ...(events || []).map((e) => JSON.stringify(e)), ''].join('\n');
-  writeFileSync(join(dir, 'session.jsonl'), lines);
-  return { id, cwd };
 }
 
 describe('inject', () => {
@@ -385,16 +339,18 @@ describe('move', () => {
 });
 
 describe('preset-migrate', () => {
-  it('migrate 生效：工件头行 preset 被改写', async () => {
-    const dir = await realDir('browser-t3-pm-');
-    writeSession(dir, 's-p', { agentPreset: 'a' }, []);
-    const entities = [makeEntity('w1', dir, ['s-p'])];
-    const files = { 's-p': { id: 's-p', cwd: dir } };
-    const { handler } = makeCtx({
-      entities,
-      files,
-      persistence: makeLegacyPersistence(entities, files),
+  // 官方语义（Task 4）：空白会话走 agentPresets.select，非空白（select 抛
+  // agent-preset/locked）拒绝。旧 preset 经 composedPreset/agent ctx 读，
+  // 回退 sessions.get 的 live session header。
+  it('空白会话走官方 select：migrated:true，newPreset 为 select 返回 id', async () => {
+    const agent = { id: 's-p', ctx: {} };
+    const { handler, selectCalls } = makeCtx({
+      entities: [],
       presets: [{ id: 'a' }, { id: 'b' }],
+      live: {
+        agents: { 's-p': agent },
+        sessions: { 's-p': { id: 's-p', header: { agentPreset: 'a' } } },
+      },
     });
     const { status, body } = await callApi(handler, 'preset-migrate', {
       sessionId: 's-p', toPreset: 'b',
@@ -404,26 +360,81 @@ describe('preset-migrate', () => {
     assert.deepEqual(body.result, {
       sessionId: 's-p', migrated: true, oldPreset: 'a', newPreset: 'b',
     });
-    const newHeader = JSON.parse(readFileSync(join(dir, 's-p', 'session.jsonl'), 'utf8').split('\n')[0]);
-    assert.equal(newHeader.agentPreset, 'b', '头行 agentPreset 应改写为目标预设');
+    assert.equal(selectCalls.length, 1, '应调用 agentPresets.select');
+    assert.equal(selectCalls[0][0], agent, 'select 第一个参数应为 live agent');
+    assert.equal(selectCalls[0][1], 'b');
   });
 
-  it('migrate 同预设为 no-op（migrated:false）', async () => {
-    const dir = await realDir('browser-t3-pm-noop-');
-    writeSession(dir, 's-q', { agentPreset: 'a' }, []);
-    const entities = [makeEntity('w1', dir, ['s-q'])];
-    const files = { 's-q': { id: 's-q', cwd: dir } };
-    const { handler } = makeCtx({
-      entities,
-      files,
-      persistence: makeLegacyPersistence(entities, files),
+  it('migrate 同预设为 no-op（migrated:false，不调 select）', async () => {
+    const agent = { id: 's-q', ctx: {} };
+    const { handler, selectCalls } = makeCtx({
+      entities: [],
       presets: [{ id: 'a' }, { id: 'b' }],
+      live: {
+        agents: { 's-q': agent },
+        sessions: { 's-q': { id: 's-q', header: { agentPreset: 'a' } } },
+      },
     });
     const { body } = await callApi(handler, 'preset-migrate', {
       sessionId: 's-q', toPreset: 'a',
     });
     assert.equal(body.ok, true);
+    assert.deepEqual(body.result, {
+      sessionId: 's-q', migrated: false, oldPreset: 'a', newPreset: 'a',
+    });
+    assert.equal(selectCalls.length, 0, 'no-op 不应调用 select');
+  });
+
+  it('migrate 经 composedPreset 读旧预设（优先于 session header）', async () => {
+    const agent = { id: 's-c', ctx: {} };
+    const { handler, selectCalls } = makeCtx({
+      entities: [],
+      presets: [{ id: 'a' }, { id: 'b' }],
+      live: {
+        agents: { 's-c': agent },
+        sessions: { 's-c': { id: 's-c', header: { agentPreset: 'stale' } } },
+      },
+      composedPresetImpl: () => 'a',
+    });
+    const { body } = await callApi(handler, 'preset-migrate', {
+      sessionId: 's-c', toPreset: 'a',
+    });
+    assert.equal(body.ok, true);
     assert.equal(body.result.migrated, false);
+    assert.equal(body.result.oldPreset, 'a');
+    assert.equal(selectCalls.length, 0);
+  });
+
+  it('migrate 非空白会话：select 抛 agent-preset/locked → ok:false 且 error 含"已开始"', async () => {
+    const locked = new Error('This session has already started');
+    locked.code = 'agent-preset/locked';
+    const { handler } = makeCtx({
+      entities: [],
+      presets: [{ id: 'a' }, { id: 'b' }],
+      live: {
+        agents: { 's-busy': { id: 's-busy', ctx: {} } },
+        sessions: { 's-busy': { id: 's-busy', header: { agentPreset: 'a' } } },
+      },
+      selectImpl: () => { throw locked; },
+    });
+    const { body } = await callApi(handler, 'preset-migrate', {
+      sessionId: 's-busy', toPreset: 'b',
+    });
+    assert.equal(body.ok, false);
+    assert.match(body.error, /已开始/);
+  });
+
+  it('migrate 无 live agent 返回 ok:false（含"没有 live agent"）', async () => {
+    const { handler, selectCalls } = makeCtx({
+      entities: [],
+      presets: [{ id: 'a' }, { id: 'b' }],
+    });
+    const { body } = await callApi(handler, 'preset-migrate', {
+      sessionId: 's-ghost', toPreset: 'b',
+    });
+    assert.equal(body.ok, false);
+    assert.match(body.error, /没有 live agent/);
+    assert.equal(selectCalls.length, 0, '无 agent 时不应调用 select');
   });
 
   it('migrate 缺少参数 / 未知预设返回 ok:false', async () => {

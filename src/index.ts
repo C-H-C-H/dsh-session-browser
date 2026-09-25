@@ -14,7 +14,7 @@
  */
 import type { Context } from 'cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { mkdir, open, realpath, rename, rm } from 'node:fs/promises'
+import { realpath, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 
 /** Stable plugin name. */
@@ -269,22 +269,23 @@ async function handleDelete(ctx: Context, payload: Record<string, unknown>) {
   }
 }
 
-/** ------------------------------------------------------------------ Task 3: move / preset-migrate / workspaces.
- * move 已重写为 fork 式迁移（0.1.7 公开 API）：observeSession 读源会话 →
+/** ------------------------------------------------------------------ Task 3/4: move / preset-migrate / workspaces.
+ * move 是 fork 式迁移（0.1.7 公开 API）：observeSession 读源会话 →
  * agents.create（回退 sessions.create）按目标 cwd 建新会话并复制事件种子 →
  * registry 记账切换 → 旧会话 archiveSession(stopActivity:true) 归档保留。
- * migratePreset / listWorkspaces 仍是 session-manager 移植旧实现（Task 4/8 的活）。
+ * migratePreset 是官方语义（Task 4）：list 校验 → agents.get 取 live agent →
+ * 旧 preset 经 composedPreset/agent ctx 读（回退 sessions.get 的 header）→
+ * 相同则 no-op → presets.select 切换；select 抛 agent-preset/locked（非空白）
+ * 转中文错。listWorkspaces 仍是 session-manager 移植实现（Task 8 的活）。
  * Live registries use ctx.sessions / ctx.agents property access like the
  * original (hence the inject entries); sessionQuery/persistence/presets stay
  * ctx.get lazy accesses and are intentionally NOT listed.
  */
 
 /**
- * Hex nonce for temp-file names and fork-style move child ids.
- * session-manager uses node:crypto randomBytes; this host keeps the waived
- * node:* surface to fs/promises + path (R5), so a Math.random nonce is used
- * instead — uniqueness is best-effort either way because writeTempFile opens
- * with 'wx' (exclusive) and rename failures roll back.
+ * Hex nonce for fork-style move child ids. session-manager uses node:crypto
+ * randomBytes; this host keeps the waived node:* surface to fs/promises + path
+ * (R5), so a Math.random nonce is used instead — uniqueness is best-effort.
  */
 function randomHex(bytes: number): string {
   let out = ''
@@ -315,45 +316,6 @@ function listWorkspaces(ctx: Context): unknown[] {
       sessionIds: rawIds,
     }
   })
-}
-
-/**
- * Durable temp-file write next to its final target. Ported from session-manager
- * `writeTempFile` (randomBytes → randomHex, see above). Returns the temp path;
- * the caller publishes it with a rename once the coast is clear.
- * (Kept for preset-migrate until Task 4 rewrites it.)
- */
-async function writeTempFile(finalPath: string, data: Buffer): Promise<string> {
-  const temp = `${finalPath}.${randomHex(6)}.tmp`
-  const handle = await open(temp, 'wx', 0o600)
-  try {
-    await handle.writeFile(data)
-    await handle.sync()
-  } finally {
-    await handle.close()
-  }
-  return temp
-}
-
-/**
- * Encode the moved artifact in the backend's own physical layout: plain JSONL,
- * or zstd frames whose FIRST frame is exactly the header line (the reader's
- * assertZstdHeaderFrame / readFirstZstdLine contract). Ported verbatim.
- * (Kept for preset-migrate until Task 4 rewrites it.)
- */
-async function encodeArtifact(headerLine: string, rest: string, isZstd: boolean): Promise<Buffer> {
-  if (!isZstd) return Buffer.from(`${headerLine}\n${rest}`, 'utf8')
-  const { zstdCompress } = await import('node:zlib')
-  if (typeof zstdCompress !== 'function') {
-    throw new Error('当前 Node 运行时没有 zstd 支持，无法迁移 zstd 编码的会话工件')
-  }
-  const compress = (buffer: Buffer): Promise<Buffer> => new Promise((resolve, reject) => {
-    zstdCompress(buffer, (error: unknown, output: Buffer) => error == null ? resolve(output) : reject(error))
-  })
-  const headerFrame = await compress(Buffer.from(`${headerLine}\n`, 'utf8'))
-  if (rest === '') return headerFrame
-  const bodyFrame = await compress(Buffer.from(rest, 'utf8'))
-  return Buffer.concat([headerFrame, bodyFrame])
 }
 
 /**
@@ -497,72 +459,29 @@ async function moveSession(ctx: Context, sessionId: string, targetWorkspaceId: s
     wasLive
   }
 }
-/* === preset-migration (session-manager v0.3.0) === */
-const NL = String.fromCharCode(10)
+/* === preset-migration (official 0.1.7 semantics) === */
 
 /**
- * Fully retire a live agent/session before rewriting its durable preset.
- * Ported from session-manager `retireForPresetMigration` verbatim (see
- * original): waiting through persistence.load()/inspect() is the ownership
- * barrier, and only a proven-orphaned persistence owner is cleared.
- */
-async function retireForPresetMigration(ctx: Context, sessionId: string, persistence: any): Promise<void> {
-  const liveAgents: any = (ctx as any).agents
-  const liveSessions: any = (ctx as any).sessions
-  const logger: any = (ctx as any).logger
-  const agent = liveAgents?.get?.(sessionId)
-  if (agent !== undefined) {
-    try { agent.cancel({ kind: 'disposed' }) } catch { /* best-effort */ }
-    if (typeof agent.whenIdle === 'function') await agent.whenIdle()
-    if (typeof agent.scope?.dispose === 'function') await agent.scope.dispose()
-    try { liveAgents.store?.delete?.(sessionId) } catch { /* best-effort */ }
-  }
-
-  const entry = liveSessions?.store?.get?.(sessionId)
-  if (entry !== undefined && typeof entry.detach === 'function') entry.detach()
-
-  // Do not mutate the artifact until both registries have released it.
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (liveAgents?.get?.(sessionId) === undefined && liveSessions?.get?.(sessionId) === undefined) break
-    await sleep(25)
-  }
-  if (liveAgents?.get?.(sessionId) !== undefined || liveSessions?.get?.(sessionId) !== undefined) {
-    throw new Error(`会话 "${sessionId}" 无法安全关闭，已取消预设迁移`)
-  }
-
-  if (typeof persistence.inspect === 'function') {
-    await persistence.inspect(sessionId)
-  } else if (typeof persistence.load === 'function') {
-    await persistence.load(sessionId)
-  }
-
-  // Recovery for sessions affected by the older move/preset code (see original).
-  const states = persistence.states
-  const state = states?.get?.(sessionId)
-  if (state?.owner !== undefined) {
-    states.delete(sessionId)
-    logger.warn(`session-manager: cleared stale persistence owner for "${sessionId}" during preset migration`)
-  }
-}
-
-/**
- * Rewrite exactly one conversation's effective Agent preset. Ported from
- * session-manager `migratePreset`: sessions with an agent-preset/selected event
- * derive their preset from the LAST such event (rewrite that event); older
- * sessions derive it from the header (rewrite only the header field).
+ * Switch the Agent preset of a blank session via the official face.
+ * Confirmed semantics: preset-migrate = `agentPresets.select` on a blank
+ * session; non-blank sessions are refused (select throws agent-preset/locked).
+ * Steps: validate args → list roster + find target (+broken check) →
+ * agents.get(sessionId) for the live agent (missing → 中文错) →
+ * read the old preset (composedPreset(agent.ctx) first, live session header
+ * fallback) → same preset is a no-op → presets.select(agent, toPreset) →
+ * locked errors become the 中文 "已开始" refusal.
  */
 async function migratePreset(ctx: Context, opts: { sessionId: string; toPreset: string }): Promise<Record<string, unknown>> {
-  const logger: any = (ctx as any).logger
   const sessionId = typeof opts.sessionId === 'string' ? opts.sessionId.trim() : ''
   const toPreset = typeof opts.toPreset === 'string' ? opts.toPreset.trim() : ''
   if (sessionId === '') { const e = new Error('sessionId required') as Error & { code?: string }; e.code = 'bad-request'; throw e }
   if (toPreset === '') { const e = new Error('toPreset required') as Error & { code?: string }; e.code = 'bad-request'; throw e }
 
-  const presets = ctx.get('agentPresets')
-  if (presets === undefined || typeof (presets as any).list !== 'function') {
+  const presets: any = ctx.get('agentPresets')
+  if (presets === undefined || typeof presets.list !== 'function') {
     throw new Error('agentPresets service unavailable')
   }
-  const roster = await (presets as any).list()
+  const roster = await presets.list()
   const target = (roster || []).find((preset: any) => preset && preset.id === toPreset)
   if (target === undefined) {
     const available = (roster || []).map((preset: any) => preset?.id).filter(Boolean)
@@ -570,92 +489,36 @@ async function migratePreset(ctx: Context, opts: { sessionId: string; toPreset: 
   }
   if (target.broken !== undefined) throw new Error(`Agent 预设 "${toPreset}" 不可用：${target.broken}`)
 
-  const persistence: any = ctx.get('sessionPersistence')
-  if (persistence === undefined) throw new Error('sessionPersistence service unavailable')
-  if (typeof persistence.readRaw !== 'function') throw new Error('current persistence backend does not support readRaw')
+  const liveAgents: any = (ctx as any).agents
+  const liveSessions: any = (ctx as any).sessions
+  const agent = liveAgents?.get?.(sessionId)
+  if (agent === undefined) throw new Error(`会话 "${sessionId}" 没有 live agent，无法切换预设（仅空白会话支持在线切换）`)
 
-  // Build the replacement before touching the live lifecycle (Plan B rule).
-  const raw = await persistence.readRaw(sessionId)
-  if (raw === undefined) throw new Error(`session "${sessionId}" has no artifact`)
-  const lines = raw.content.split(NL)
-  if (lines.length < 2) throw new Error('session artifact has no header line')
-  let headerObj: any
-  try { headerObj = JSON.parse(lines[0]) } catch { throw new Error('session header parse failed') }
-  if (headerObj.id !== sessionId) throw new Error('session header id mismatch')
-
-  let selectedIndex = -1
-  let selectedPreset: string | undefined
-  for (let index = 1; index < lines.length; index += 1) {
-    if (lines[index] === '') continue
-    let event: any
-    try { event = JSON.parse(lines[index]) } catch { continue }
-    if (event && event.type === 'agent-preset/selected' && event.data && typeof event.data.agentPreset === 'string') {
-      selectedIndex = index
-      selectedPreset = event.data.agentPreset
-    }
+  let oldPreset: string | undefined
+  try {
+    if (typeof presets.composedPreset === 'function') oldPreset = presets.composedPreset(agent.ctx)
+  } catch { /* best-effort: fall back to the live session header */ }
+  if (oldPreset === undefined) {
+    const liveSession = liveSessions?.get?.(sessionId)
+    const headerPreset = liveSession?.header?.agentPreset
+    if (typeof headerPreset === 'string') oldPreset = headerPreset
   }
-  const oldPreset = selectedIndex >= 0 ? selectedPreset : headerObj.agentPreset
   if (oldPreset === toPreset) {
     return { sessionId, migrated: false, oldPreset, newPreset: toPreset }
   }
 
-  if (selectedIndex >= 0) {
-    const event = JSON.parse(lines[selectedIndex])
-    event.data = { ...event.data, agentPreset: toPreset }
-    lines[selectedIndex] = JSON.stringify(event)
-  } else {
-    headerObj.agentPreset = toPreset
-    lines[0] = JSON.stringify(headerObj)
-  }
-
-  await retireForPresetMigration(ctx, sessionId, persistence)
-
-  // Re-read after retirement so a final buffered append cannot be lost (same
-  // Plan-B rule applied to the final durable text).
-  const settledRaw = await persistence.readRaw(sessionId)
-  if (settledRaw === undefined) throw new Error(`session "${sessionId}" disappeared during retirement`)
-  const settledLines = settledRaw.content.split(NL)
-  let settledHeader: any
-  try { settledHeader = JSON.parse(settledLines[0]) } catch { throw new Error('settled session header parse failed') }
-  let settledSelectedIndex = -1
-  for (let index = 1; index < settledLines.length; index += 1) {
-    if (settledLines[index] === '') continue
-    let event: any
-    try { event = JSON.parse(settledLines[index]) } catch { continue }
-    if (event && event.type === 'agent-preset/selected' && event.data && typeof event.data.agentPreset === 'string') {
-      settledSelectedIndex = index
-    }
-  }
-  if (settledSelectedIndex >= 0) {
-    const event = JSON.parse(settledLines[settledSelectedIndex])
-    event.data = { ...event.data, agentPreset: toPreset }
-    settledLines[settledSelectedIndex] = JSON.stringify(event)
-  } else {
-    settledHeader.agentPreset = toPreset
-    settledLines[0] = JSON.stringify(settledHeader)
-  }
-
-  const location = persistence.locate(settledRaw.meta)
-  if (location === undefined) throw new Error('locate returned undefined')
-  const replacementContent = settledLines.join(NL)
-  const firstNewline = replacementContent.indexOf(NL)
-  const headerLine = replacementContent.slice(0, firstNewline)
-  const rest = replacementContent.slice(firstNewline + 1)
-  const bytes = await encodeArtifact(headerLine, rest, location.path.endsWith('.zstd'))
-  await mkdir(dirname(location.path), { recursive: true })
-  const tempPath = await writeTempFile(location.path, bytes)
+  let committed: string
   try {
-    await rename(tempPath, location.path)
-  } catch (error) {
-    try { await rm(tempPath, { force: true }) } catch { /* ignore */ }
-    throw new Error('preset migration rename failed: ' + String(error))
+    committed = await presets.select(agent, toPreset)
+  } catch (err) {
+    const code = (err as unknown as { code?: unknown })?.code
+    const message = String(err instanceof Error ? err.message : err)
+    if (code === 'agent-preset/locked' || /already started|locked/i.test(message)) {
+      throw new Error(`会话 "${sessionId}" 已开始，无法切换预设（可 fork 该会话后再选预设）`)
+    }
+    throw err
   }
-
-  // Same public notification as the built-in blank-session preset switch (see
-  // original): updates the displayed preset without fabricating a live Session.
-  try { (ctx as any).emit('agent-preset/selected', sessionId, toPreset) } catch { /* best-effort */ }
-  logger.info(`session-manager: migrated preset for "${sessionId}" from "${String(oldPreset)}" to "${toPreset}"`)
-  return { sessionId, migrated: true, oldPreset, newPreset: toPreset }
+  return { sessionId, migrated: true, oldPreset, newPreset: committed }
 }
 
 function requireTargetWorkspaceId(payload: Record<string, unknown>): string {
