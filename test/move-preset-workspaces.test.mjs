@@ -234,7 +234,7 @@ describe('move', () => {
     const seedEvents = [{ seq: 0, type: 'user/message', data: { content: 'hi' } }];
     const { handler, state, created, archiveCalls } = makeCtx({
       entities: [srcEnt, dstEnt],
-      observation: { header: { id: 's-move', cwd: src }, events: seedEvents },
+      observation: { header: { id: 's-move', cwd: src, agentPreset: 'code' }, events: seedEvents },
     });
     const { status, body } = await callApi(handler, 'move', {
       sessionId: 's-move', targetWorkspaceId: 'w-dst',
@@ -242,11 +242,13 @@ describe('move', () => {
     assert.equal(status, 200);
     assert.equal(body.ok, true);
     assert.equal(body.result.moved, true);
-    // agents.create 接到建新会话请求：meta.cwd 为目标路径，seed 为源事件。
+    // agents.create 接到建新会话请求：meta.cwd 为目标路径，seed 为源事件，
+    // 源会话的 agentPreset 透传到新会话 meta。
     const createResult = created[0];
     assert.ok(createResult, '应调用 agents.create 建新会话');
     assert.equal(createResult.via, 'agents');
     assert.equal(createResult.meta.cwd, dst);
+    assert.equal(createResult.meta.agentPreset, 'code');
     assert.deepEqual(createResult.seed, seedEvents);
     // 返回的新 id 即创建时用的 id。
     assert.equal(body.result.newSessionId, createResult.sessionId);

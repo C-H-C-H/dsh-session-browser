@@ -433,18 +433,22 @@ async function moveSession(ctx: Context, sessionId: string, targetWorkspaceId: s
   }
 
   // ---- 2. fork: create the new session at the target cwd with the copied seed ----
+  // Preserve the source preset attribution: without it the forked session
+  // loses its preset (falls back to the default).
   const newSessionId = `session-${randomHex(8)}`
   const seed = sourceEvents
+  const newMeta: Record<string, unknown> = { cwd: targetPath }
+  if (typeof sourceHeader?.agentPreset === 'string') newMeta.agentPreset = sourceHeader.agentPreset
   if (liveAgents !== undefined && typeof liveAgents.create === 'function') {
     await liveAgents.create({
       sessionId: newSessionId,
-      meta: { cwd: targetPath },
+      meta: newMeta,
       seed,
     })
   } else if (liveSessions !== undefined && typeof liveSessions.create === 'function') {
     await liveSessions.create({
       sessionId: newSessionId,
-      meta: { cwd: targetPath },
+      meta: newMeta,
       seed,
     })
   } else {
