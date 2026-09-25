@@ -1,32 +1,29 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { apply } from '../lib/index.mjs';
 
-// Host archive / unarchive / delete（Task 2）：经 apply() 注册的 HTTP handler 测
+// Host archive / unarchive / delete：经 apply() 注册的 HTTP handler 测
 // `/session-browser/api/archive|unarchive|delete`（src/index.ts 为 TS 源码，
-// lib/index.mjs 为手写镜像的可运行产物）。有意不断言 inject 数组内容（Task 3 拥有）。
+// lib/index.mjs 为手写镜像的可运行产物）。有意不断言 inject 数组内容。
+//
+// delete 是逻辑删除（Task 5）：停止 live agent（cancel + whenIdle + flush）→
+// entry.detach（无 live 行则显式广播 session/disposed）→ 工作区记账 detach →
+// 官方 unarchiveSession 清归档成员 → persistence.stat 存在性确认（best-effort）。
+// 物理工件由后端持有：host 不调 persistence.locate（0.1.7 已移除），不碰文件系统。
 
 function makeStore(ids) {
-  // 以真实临时目录为工件：persistence.list 以目录存在为准（与磁盘实现一致），
-  // delete 的 rm 之后 list() 输出即不再包含该会话。
+  // 纯内存 header 表：list 按未删除 id 返回 header，
+  // stat 按删除集合返回 header 或 undefined。
   const store = new Map();
   for (const id of ids) {
-    const dir = mkdtempSync(join(tmpdir(), `browser-t2-${id}-`));
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'session.jsonl'), JSON.stringify({ id }) + '\n');
-    store.set(id, {
-      header: { id, cwd: join(dir, 'proj'), createdAt: 1000, updatedAt: 1000 },
-      dir,
-    });
+    store.set(id, { id, cwd: `/tmp/browser-proj-${id}`, createdAt: 1000, updatedAt: 1000 });
   }
   return store;
 }
 
 function makeCtx({ ids, archivedIds, live }) {
   const store = makeStore(ids);
+  const deleted = new Set();
   const state = { archivedSessionIds: [...archivedIds] };
   const wsSessionIds = [...ids];
   const detachedCalls = [];
@@ -55,29 +52,42 @@ function makeCtx({ ids, archivedIds, live }) {
       state.archivedSessionIds = state.archivedSessionIds.filter((id) => id !== sid);
     },
   };
+  const statCalls = [];
   const persistence = {
-    list: async () => [...store.values()]
-      .filter((v) => existsSync(v.dir))
-      .map((v) => v.header),
+    list: async () => [...store.values()].filter((h) => !deleted.has(h.id)),
+    stat: async (sid) => {
+      statCalls.push(sid);
+      return deleted.has(sid) ? undefined : store.get(sid);
+    },
     open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
-    locate: (meta) => ({ path: join(store.get(meta.id).dir, 'session.jsonl') }),
   };
   const services = { sessionPersistence: persistence, workspaceRegistry: registry };
   const entryDetachCalls = [];
+  const cancelCalls = [];
+  const whenIdleCalls = [];
+  const flushCalls = [];
   if (live) {
     services.sessions = {
       get: (sid) => (sid === live ? { id: sid } : undefined),
-      flush: async () => {},
+      flush: async (session) => { flushCalls.push(session); },
       store: {
         get: (sid) => (sid === live
           ? { detach: () => { entryDetachCalls.push(sid); } }
           : undefined),
       },
     };
-    services.agents = { get: () => undefined, store: { delete: () => {} } };
+    services.agents = {
+      get: (sid) => (sid === live
+        ? { cancel: (opts) => { cancelCalls.push([sid, opts]); } }
+        : undefined),
+      whenIdle: async (sid) => { whenIdleCalls.push(sid); },
+    };
   }
   const emits = [];
-  const ctxExtras = { store, state, wsSessionIds, detachedCalls, emits, entryDetachCalls };
+  const ctxExtras = {
+    store, deleted, state, wsSessionIds, detachedCalls, emits,
+    entryDetachCalls, cancelCalls, whenIdleCalls, flushCalls, statCalls,
+  };
   let handler = null;
   const ctx = {
     get: (name) => services[name],
@@ -148,18 +158,18 @@ describe('archive / unarchive', () => {
 
 describe('delete', () => {
   it('delete 后会话不再出现在 list() 输出（含归档成员与工作区记账一并清除）', async () => {
-    const { handler, state, store, wsSessionIds } = makeCtx({
+    const { handler, state, wsSessionIds, statCalls } = makeCtx({
       ids: ['s-del', 's-keep'], archivedIds: ['s-del'],
     });
-    const dir = store.get('s-del').dir;
-    assert.ok(existsSync(dir));
 
     const { status, body } = await callApi(handler, 'delete', { sessionId: 's-del' });
     assert.equal(status, 200);
-    assert.deepEqual(body, { ok: true });
-    assert.ok(!existsSync(dir), '工件目录应被 rm 删除');
+    assert.equal(body.ok, true);
+    assert.equal(body.result?.deleted, true);
+    assert.equal(body.result?.artifactRemoved, false);
     assert.ok(!state.archivedSessionIds.includes('s-del'), '归档集成员应一并清除');
     assert.ok(!wsSessionIds.includes('s-del'), '工作区记账应 detach');
+    assert.ok(statCalls.includes('s-del'), '应经 stat 确认存在');
 
     const { body: listBody } = await callApi(handler, 'list-sessions', {});
     const listIds = listBody.items.map((i) => i.sessionId);
@@ -167,24 +177,32 @@ describe('delete', () => {
     assert.ok(listIds.includes('s-keep'));
   });
 
-  it('delete 存活会话先 detach 再删（entry.detach 被调用）', async () => {
-    const { handler, entryDetachCalls, store } = makeCtx({
+  it('delete 存活会话先停 agent 再 detach（cancel + entry.detach 被调用）', async () => {
+    const { handler, entryDetachCalls, cancelCalls, whenIdleCalls, flushCalls } = makeCtx({
       ids: ['s-live'], archivedIds: [], live: 's-live',
     });
     const { body } = await callApi(handler, 'delete', { sessionId: 's-live' });
-    assert.deepEqual(body, { ok: true });
+    assert.equal(body.ok, true);
+    assert.deepEqual(cancelCalls, [['s-live', { kind: 'disposed' }]]);
+    assert.deepEqual(whenIdleCalls, ['s-live']);
+    assert.equal(flushCalls.length, 1);
     assert.deepEqual(entryDetachCalls, ['s-live']);
-    assert.ok(!existsSync(store.get('s-live').dir));
+    assert.equal(body.result?.deleted, true);
+    assert.equal(body.result?.wasLive, true);
+    assert.equal(body.result?.detached, true);
   });
 
   it('delete 无存活条目时广播 session/disposed（客户端清行）', async () => {
-    const { handler, emits } = makeCtx({ ids: ['s-gone'], archivedIds: [] });
+    const { handler, emits, statCalls } = makeCtx({ ids: ['s-gone'], archivedIds: [] });
     const { body } = await callApi(handler, 'delete', { sessionId: 's-gone' });
-    assert.deepEqual(body, { ok: true });
+    assert.equal(body.ok, true);
+    assert.equal(body.result?.deleted, true);
+    assert.equal(body.result?.wasLive, false);
     assert.ok(
       emits.some(([event, payload]) => event === 'session/disposed' && payload?.id === 's-gone'),
       '应 emit session/disposed 让各客户端丢弃该行',
     );
+    assert.ok(statCalls.includes('s-gone'), '应经 stat 确认存在');
   });
 
   it('delete 缺少 sessionId 返回 ok:false', async () => {

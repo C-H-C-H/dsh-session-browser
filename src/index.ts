@@ -14,8 +14,7 @@
  */
 import type { Context } from 'cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { realpath, rm } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { realpath } from 'node:fs/promises'
 
 /** Stable plugin name. */
 export const name = 'dsh-session-browser'
@@ -159,42 +158,29 @@ async function detachFromWorkspaces(ctx: Context, sessionId: string): Promise<vo
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
-/** Resolve the on-disk session directory (parent of its artifact), if any. Ported from session-manager. */
-async function sessionDirOf(ctx: Context, sessionId: string): Promise<string | undefined> {
-  const persistence: any = ctx.get('sessionPersistence')
-  if (persistence === undefined) return undefined
-  const headers = normalizeHeaders(await persistence.list())
-  const meta = headers.find((header: any) => header.id === sessionId)
-  if (meta === undefined) return undefined
-  const location = persistence.locate(meta)
-  if (location === undefined) return undefined
-  return dirname(location.path)
-}
-
 /**
- * Delete one session end to end: live session teardown → `entry.detach()` →
- * flush/remove JSONL artifact dir → remove workspace accounting → remove
- * archive-set membership. Ported from session-manager `deleteSession`
- * (unrelated move/preset branches dropped; `sessions`/`agents` are optional
- * here until Task 3 extends `inject`, so absent services skip live teardown).
+ * Delete one session (logical delete): stop the live agent → `entry.detach()`
+ * (or an explicit `session/disposed` emit when no live row exists) → remove
+ * workspace accounting → remove archive-set membership via the official
+ * `unarchiveSession` → `persistence.stat` existence check (best-effort).
+ * Physical artifacts stay with the backend: no `persistence.locate`
+ * (removed in 0.1.7), no filesystem removal.
  */
-async function deleteSession(ctx: Context, sessionId: string): Promise<void> {
+async function deleteSession(ctx: Context, sessionId: string): Promise<Record<string, unknown>> {
   const liveSessions: any = ctx.get('sessions')
   const liveAgents: any = ctx.get('agents')
   const session = liveSessions?.get?.(sessionId)
   const agent = liveAgents?.get?.(sessionId)
+  const wasLive = session !== undefined || agent !== undefined
 
   if (agent !== undefined) {
     // Stop any running turn (disposed-kind suppresses re-wake).
-    agent.cancel({ kind: 'disposed' })
-    // Quiesce the agent's own fiber (idempotent; bounded in case teardown stalls).
-    if (typeof agent.scope?.dispose === 'function') {
-      await Promise.race([agent.scope.dispose(), sleep(3000)])
-    }
-    // Drop the zombie from the registry so a later session.create/open with
-    // the same id cannot resurrect it.
     try {
-      liveAgents.store?.delete?.(sessionId)
+      agent.cancel({ kind: 'disposed' })
+    } catch { /* best-effort */ }
+    // Quiesce the agent's own fiber via the registry face.
+    try {
+      if (typeof liveAgents?.whenIdle === 'function') await liveAgents.whenIdle(sessionId)
     } catch { /* best-effort */ }
   }
 
@@ -216,9 +202,8 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<void> {
       }
     } catch { /* best-effort */ }
   }
-  // Sessions with a stored artifact but no live store row never fire
-  // entry.detach() — emit session/disposed explicitly so every connected
-  // client drops the row.
+  // Sessions with no live store row never fire entry.detach() — emit
+  // session/disposed explicitly so every connected client drops the row.
   if (!detached) {
     try {
       if (typeof (ctx as any).emit === 'function') (ctx as any).emit('session/disposed', { id: sessionId })
@@ -229,10 +214,19 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<void> {
   await detachFromWorkspaces(ctx, sessionId)
   await unarchiveSession(ctx, sessionId)
 
-  // Physical artifact (session.jsonl / session.jsonl.zstd) + any extras.
-  const dir = await sessionDirOf(ctx, sessionId)
-  if (dir !== undefined) {
-    await rm(dir, { recursive: true, force: true })
+  // Existence confirmation only (best-effort) — physical artifacts stay
+  // with the backend, nothing is removed from disk here.
+  try {
+    const persistence: any = ctx.get('sessionPersistence')
+    if (typeof persistence?.stat === 'function') await persistence.stat(sessionId)
+  } catch { /* best-effort */ }
+
+  return {
+    deleted: true,
+    wasLive,
+    detached,
+    artifactRemoved: false,
+    note: '逻辑记录已清理；物理工件由后端持有，未做物理删除',
   }
 }
 
@@ -262,8 +256,8 @@ async function handleUnarchive(ctx: Context, payload: Record<string, unknown>) {
 
 async function handleDelete(ctx: Context, payload: Record<string, unknown>) {
   try {
-    await deleteSession(ctx, requireSessionId(payload))
-    return { ok: true }
+    const result = await deleteSession(ctx, requireSessionId(payload))
+    return { ok: true, result }
   } catch (err) {
     return { ok: false, error: String(err instanceof Error ? err.message : err) }
   }
@@ -487,12 +481,12 @@ async function migratePreset(ctx: Context, opts: { sessionId: string; toPreset: 
     const available = (roster || []).map((preset: any) => preset?.id).filter(Boolean)
     throw new Error(`Agent 预设 "${toPreset}" 不存在（可用：${available.join(', ')}）`)
   }
-  if (target.broken !== undefined) throw new Error(`Agent 预设 "${toPreset}" 不可用：${target.broken}`)
+  if (target.broken) throw new Error(`Agent 预设 "${toPreset}" 不可用：${target.broken}`)
 
   const liveAgents: any = (ctx as any).agents
   const liveSessions: any = (ctx as any).sessions
   const agent = liveAgents?.get?.(sessionId)
-  if (agent === undefined) throw new Error(`会话 "${sessionId}" 没有 live agent，无法切换预设（仅空白会话支持在线切换）`)
+  if (agent == null) throw new Error(`会话 "${sessionId}" 没有 live agent，无法切换预设（仅空白会话支持在线切换）`)
 
   let oldPreset: string | undefined
   try {
