@@ -8,10 +8,11 @@ import { apply, inject } from '../lib/index.mjs';
 
 // Host move / preset-migrate / workspaces（Task 3）：经 apply() 注册的 HTTP handler 测
 // `/session-browser/api/move|preset-migrate|workspaces`（src/index.ts 为 TS 源码，
-// lib/index.mjs 为手写镜像的可运行产物）。inject 由本 task 拥有，故此处断言
-// 移植代码实际经 ctx.X 使用的服务（quietLive / move / retireForPresetMigration
-// 使用 ctx.sessions + ctx.agents 属性；sessionPersistence / agentPresets 维持
-// ctx.get 懒取，不进 inject）。
+// lib/index.mjs 为手写镜像的可运行产物）。move 已重写为 fork 式迁移，只用公开脸：
+// sessionQuery.observeSession 读源会话、agents.create（回退 sessions.create）建新
+// 会话、workspaceRegistry 做记账切换与归档。不再 mock readRaw/loadStored/locate/
+// prepare/enter（旧 move 用的已移除能力）。preset-migrate 仍是旧实现（Task 4 的活），
+// 其用例经 persistence 选项显式传入旧工件 mock。
 
 function makeEntity(id, dirPath, ids) {
   const record = { sessionIds: [...ids] };
@@ -30,16 +31,9 @@ function makeEntity(id, dirPath, ids) {
   };
 }
 
-// 基于真实临时文件的持久化 mock：locate 按 meta.cwd 定位（move 的 re-home
-// 断言依赖它），list 以文件存在为准，loadStored 从头行重建 meta。
-function makeCtx({ entities, files, presets }) {
-  const state = { archivedSessionIds: [] };
-  const registry = {
-    list: () => entities,
-    requireState: () => state,
-    enqueueOperation: async (fn) => fn(),
-    setState: async (next) => { Object.assign(state, next); },
-  };
+// preset-migrate 旧实现（Task 4 重写前）用的工件级 mock：locate 按 meta.cwd
+// 定位，list 以文件存在为准，readRaw 从头行重建 meta。move 新实现不用它。
+function makeLegacyPersistence(entities, files) {
   const seedDirs = () => [...new Set([
     ...entities.map((e) => e.path),
     ...Object.values(files).map((f) => f.cwd),
@@ -51,7 +45,7 @@ function makeCtx({ entities, files, presets }) {
     }
     return undefined;
   };
-  const persistence = {
+  return {
     locate: (meta) => ({ path: join(meta.cwd, meta.id, 'session.jsonl') }),
     // 真后端按 id 定位工件（不知 cwd）：扫描已知工作区目录 + 种子 cwd，
     // meta.cwd 取自磁盘头行（move 后 loadStored 能找到新位置并返回新 cwd）。
@@ -83,27 +77,83 @@ function makeCtx({ entities, files, presets }) {
     },
     inspect: async () => {},
   };
-  const prepared = [];
-  const entered = [];
+}
+
+// 新 move 只用公开脸：sessionQuery.observeSession（源会话读取）、agents.create
+//（首选）/ sessions.create（回退）、sessions.get/flush + agents.get/cancel/whenIdle
+//（live 停止）、workspaceRegistry.list/get/attach/detach/enqueueOperation/
+// archiveSession（记账切换与旧会话归档）。
+function makeCtx({ entities, presets, observation, observeError, live, noAgentsCreate, persistence }) {
+  const state = { archivedSessionIds: [] };
+  const created = [];      // agents.create / sessions.create 调用参数（created[0].meta.cwd 即新会话 cwd）
+  const observes = [];     // observeSession 调用记录
+  const archiveCalls = []; // archiveSession 调用记录（含 stopActivity opts）
+  const flushed = [];      // sessions.flush 调用记录
+  const cancelled = [];    // agent.cancel 调用记录
+  const registry = {
+    list: () => entities,
+    get: (id) => entities.find((e) => e.id === id),
+    requireState: () => state,
+    enqueueOperation: async (fn) => fn(),
+    setState: async (next) => { Object.assign(state, next); },
+    archiveSession: async (id, opts) => {
+      if (!state.archivedSessionIds.includes(id)) state.archivedSessionIds.push(id);
+      archiveCalls.push([id, opts]);
+    },
+    unarchiveSession: async (id) => {
+      state.archivedSessionIds = state.archivedSessionIds.filter((x) => x !== id);
+    },
+  };
+  const liveAgents = new Map(Object.entries(live?.agents || {}));
+  const liveSessions = new Map(Object.entries(live?.sessions || {}));
   const emits = [];
+  const sessionQuery = {
+    observeSession: async (id, opts) => {
+      observes.push([id, opts]);
+      if (observeError) throw observeError;
+      if (observation === undefined) {
+        const err = new Error(`session "${id}" not found`);
+        err.code = 'SESSION_QUERY_SESSION_NOT_FOUND';
+        throw err;
+      }
+      const header = observation.header;
+      const events = observation.events || [];
+      return {
+        source: 'prepared',
+        header,
+        inheritedEventCount: 0,
+        events,
+        cursor: events.length === 0 ? -1 : events.length - 1,
+        [Symbol.dispose]: () => {},
+      };
+    },
+  };
   const services = {
-    sessionPersistence: persistence,
     workspaceRegistry: registry,
+    sessionQuery,
     agentPresets: { list: async () => presets || [] },
+    ...(persistence === undefined ? {} : { sessionPersistence: persistence }),
   };
   let handler = null;
   const ctx = {
     get: (name) => services[name],
     sessions: {
-      get: () => undefined,
-      store: { get: () => undefined },
-      prepare: (sid, opts) => { prepared.push([sid, opts]); return { id: sid }; },
-      enter: (placeholder) => {
-        entered.push(placeholder);
-        return () => {};
+      get: (id) => liveSessions.get(id),
+      flush: async (session) => { flushed.push(session); },
+      create: async (opts) => {
+        created.push({ via: 'sessions', ...opts });
+        return { sessionId: opts.sessionId };
       },
     },
-    agents: { get: () => undefined, store: { delete: () => {} } },
+    agents: {
+      get: (id) => liveAgents.get(id),
+      ...(noAgentsCreate ? {} : {
+        create: async (opts) => {
+          created.push({ via: 'agents', ...opts });
+          return { agent: { id: opts.sessionId } };
+        },
+      }),
+    },
     workspaceRegistry: registry,
     emit: (event, ...args) => { emits.push([event, ...args]); },
     logger: { info: () => {}, warn: () => {} },
@@ -112,7 +162,7 @@ function makeCtx({ entities, files, presets }) {
   };
   apply(ctx);
   assert.ok(handler, 'apply 应注册 /session-browser/api handler');
-  return { handler, state, entities, emits, prepared };
+  return { handler, state, entities, emits, created, observes, archiveCalls, flushed, cancelled };
 }
 
 async function callApi(handler, method, body) {
@@ -158,7 +208,6 @@ describe('workspaces', () => {
     const dst = await realDir('browser-t3-ws-b-');
     const { handler } = makeCtx({
       entities: [makeEntity('w1', src, ['s-1', 's-2']), makeEntity('w2', dst, [])],
-      files: {},
     });
     const { status, body } = await callApi(handler, 'workspaces', {});
     assert.equal(status, 200);
@@ -177,15 +226,15 @@ describe('workspaces', () => {
 });
 
 describe('move', () => {
-  it('move 交换归属：目标工作区含该 id，工件头行 cwd 已更新', async () => {
+  it('move 经 fork 建新会话：目标含新 id、源去旧 id、旧 id 被归档', async () => {
     const src = await realDir('browser-t3-mv-src-');
     const dst = await realDir('browser-t3-mv-dst-');
-    writeSession(src, 's-move', {}, [{ type: 'user/message', data: { content: 'hi' } }]);
     const srcEnt = makeEntity('w-src', src, ['s-move']);
     const dstEnt = makeEntity('w-dst', dst, []);
-    const { handler } = makeCtx({
+    const seedEvents = [{ seq: 0, type: 'user/message', data: { content: 'hi' } }];
+    const { handler, state, created, archiveCalls } = makeCtx({
       entities: [srcEnt, dstEnt],
-      files: { 's-move': { id: 's-move', cwd: src } },
+      observation: { header: { id: 's-move', cwd: src }, events: seedEvents },
     });
     const { status, body } = await callApi(handler, 'move', {
       sessionId: 's-move', targetWorkspaceId: 'w-dst',
@@ -193,21 +242,84 @@ describe('move', () => {
     assert.equal(status, 200);
     assert.equal(body.ok, true);
     assert.equal(body.result.moved, true);
+    // agents.create 接到建新会话请求：meta.cwd 为目标路径，seed 为源事件。
+    const createResult = created[0];
+    assert.ok(createResult, '应调用 agents.create 建新会话');
+    assert.equal(createResult.via, 'agents');
+    assert.equal(createResult.meta.cwd, dst);
+    assert.deepEqual(createResult.seed, seedEvents);
+    // 返回的新 id 即创建时用的 id。
+    assert.equal(body.result.newSessionId, createResult.sessionId);
+    assert.equal(body.result.sessionId, createResult.sessionId);
+    // 记账切换：目标含新 id，源不再含旧 id。
+    assert.ok(dstEnt.record.sessionIds.includes(body.result.newSessionId), '目标工作区应包含新 id');
+    assert.ok(!srcEnt.record.sessionIds.includes('s-move'), '源工作区应不再包含旧 id');
+    assert.deepEqual(body.result.fromWorkspaceIds, ['w-src']);
     assert.equal(body.result.toWorkspaceId, 'w-dst');
-    assert.ok(dstEnt.record.sessionIds.includes('s-move'), '目标工作区应包含该 id');
-    assert.ok(!srcEnt.record.sessionIds.includes('s-move'), '源工作区应不再包含该 id');
-    const newHeader = JSON.parse(readFileSync(join(dst, 's-move', 'session.jsonl'), 'utf8').split('\n')[0]);
-    assert.equal(newHeader.cwd, dst, '工件头行 cwd 应重写为目标路径');
-    assert.ok(!existsSync(join(src, 's-move', 'session.jsonl')), '旧工件应已移除');
+    assert.equal(body.result.toWorkspaceTitle, 'ws-w-dst');
+    // 旧会话被归档保留（含 stopActivity 停止请求）。
+    assert.ok(state.archivedSessionIds.includes('s-move'), '旧 id 应被 archive');
+    assert.equal(body.result.archivedSourceId, 's-move');
+    assert.equal(archiveCalls[0][0], 's-move');
+    assert.equal(archiveCalls[0][1]?.stopActivity, true);
+    assert.equal(body.result.wasLive, false);
   });
 
-  it('move 已在目标工作区时为 no-op（moved:false）', async () => {
+  it('move 经 sessions.create 回退路径同样返回新 id', async () => {
+    const src = await realDir('browser-t3-mv-fb-src-');
+    const dst = await realDir('browser-t3-mv-fb-dst-');
+    const srcEnt = makeEntity('w-src', src, ['s-fb']);
+    const dstEnt = makeEntity('w-dst', dst, []);
+    const { handler, created } = makeCtx({
+      entities: [srcEnt, dstEnt],
+      observation: { header: { id: 's-fb', cwd: src }, events: [] },
+      noAgentsCreate: true,
+    });
+    const { body } = await callApi(handler, 'move', {
+      sessionId: 's-fb', targetWorkspaceId: 'w-dst',
+    });
+    assert.equal(body.ok, true);
+    assert.equal(body.result.moved, true);
+    const createResult = created[0];
+    assert.ok(createResult, '应回退到 sessions.create 建新会话');
+    assert.equal(createResult.via, 'sessions');
+    assert.equal(body.result.newSessionId, createResult.sessionId);
+    assert.ok(dstEnt.record.sessionIds.includes(body.result.newSessionId));
+  });
+
+  it('move 运行中会话：停止 live agent（cancel+whenIdle+flush）且 wasLive:true', async () => {
+    const src = await realDir('browser-t3-mv-live-src-');
+    const dst = await realDir('browser-t3-mv-live-dst-');
+    const srcEnt = makeEntity('w-src', src, ['s-live']);
+    const dstEnt = makeEntity('w-dst', dst, []);
+    let idleWaited = false;
+    const agent = {
+      cancelReason: undefined,
+      cancel: function (reason) { this.cancelReason = reason; },
+      whenIdle: async () => { idleWaited = true; },
+    };
+    const liveSession = { id: 's-live' };
+    const { handler, flushed } = makeCtx({
+      entities: [srcEnt, dstEnt],
+      observation: { header: { id: 's-live', cwd: src }, events: [] },
+      live: { agents: { 's-live': agent }, sessions: { 's-live': liveSession } },
+    });
+    const { body } = await callApi(handler, 'move', {
+      sessionId: 's-live', targetWorkspaceId: 'w-dst',
+    });
+    assert.equal(body.ok, true);
+    assert.equal(body.result.wasLive, true);
+    assert.deepEqual(agent.cancelReason, { kind: 'disposed' });
+    assert.equal(idleWaited, true, '应等待 agent.whenIdle');
+    assert.ok(flushed.includes(liveSession), '应 flush live session');
+  });
+
+  it('move 已在目标工作区时为 no-op（moved:false，不建新会话）', async () => {
     const dst = await realDir('browser-t3-mv-noop-');
-    writeSession(dst, 's-here', {}, []);
     const ent = makeEntity('w-dst', dst, ['s-here']);
-    const { handler } = makeCtx({
+    const { handler, created } = makeCtx({
       entities: [ent],
-      files: { 's-here': { id: 's-here', cwd: dst } },
+      observation: { header: { id: 's-here', cwd: dst }, events: [] },
     });
     const { body } = await callApi(handler, 'move', {
       sessionId: 's-here', targetWorkspaceId: 'w-dst',
@@ -215,10 +327,11 @@ describe('move', () => {
     assert.equal(body.ok, true);
     assert.equal(body.result.moved, false);
     assert.equal(body.result.message, '会话已属于目标工作区');
+    assert.equal(created.length, 0, 'no-op 不应创建新会话');
   });
 
   it('move 缺少 sessionId / targetWorkspaceId 返回 ok:false', async () => {
-    const { handler } = makeCtx({ entities: [], files: {} });
+    const { handler } = makeCtx({ entities: [] });
     const noSid = await callApi(handler, 'move', { targetWorkspaceId: 'w' });
     assert.equal(noSid.body.ok, false);
     assert.equal(noSid.body.error, 'sessionId 必填');
@@ -227,22 +340,45 @@ describe('move', () => {
     assert.equal(noTarget.body.error, 'targetWorkspaceId 必填');
   });
 
-  it('move 未知目标工作区 / 无磁盘记录返回中文错误', async () => {
+  it('move 未知目标工作区返回中文错误', async () => {
     const dir = await realDir('browser-t3-mv-err-');
     const { handler } = makeCtx({
       entities: [makeEntity('w1', dir, [])],
-      files: {},
+      observation: { header: { id: 's-x', cwd: dir }, events: [] },
     });
     const badTarget = await callApi(handler, 'move', {
       sessionId: 's-x', targetWorkspaceId: 'w-nope',
     });
     assert.equal(badTarget.body.ok, false);
     assert.match(badTarget.body.error, /目标工作区不存在/);
-    const noDisk = await callApi(handler, 'move', {
+  });
+
+  it('move 源会话不存在（observeSession 失败）返回中文错误', async () => {
+    const dir = await realDir('browser-t3-mv-ghost-');
+    const { handler, created } = makeCtx({
+      entities: [makeEntity('w1', dir, [])],
+    });
+    const noSource = await callApi(handler, 'move', {
       sessionId: 's-ghost', targetWorkspaceId: 'w1',
     });
-    assert.equal(noDisk.body.ok, false);
-    assert.match(noDisk.body.error, /没有磁盘记录/);
+    assert.equal(noSource.body.ok, false);
+    assert.match(noSource.body.error, /不存在/);
+    assert.equal(created.length, 0, '源不存在时不应创建新会话');
+  });
+
+  it('move 子代理（subagent）会话被拒绝', async () => {
+    const src = await realDir('browser-t3-mv-sub-src-');
+    const dst = await realDir('browser-t3-mv-sub-dst-');
+    const { handler, created } = makeCtx({
+      entities: [makeEntity('w-src', src, ['s-sub']), makeEntity('w-dst', dst, [])],
+      observation: { header: { id: 's-sub', cwd: src, origin: 'subagent' }, events: [] },
+    });
+    const { body } = await callApi(handler, 'move', {
+      sessionId: 's-sub', targetWorkspaceId: 'w-dst',
+    });
+    assert.equal(body.ok, false);
+    assert.match(body.error, /子代理/);
+    assert.equal(created.length, 0, '拒绝后不应创建新会话');
   });
 });
 
@@ -250,9 +386,12 @@ describe('preset-migrate', () => {
   it('migrate 生效：工件头行 preset 被改写', async () => {
     const dir = await realDir('browser-t3-pm-');
     writeSession(dir, 's-p', { agentPreset: 'a' }, []);
+    const entities = [makeEntity('w1', dir, ['s-p'])];
+    const files = { 's-p': { id: 's-p', cwd: dir } };
     const { handler } = makeCtx({
-      entities: [makeEntity('w1', dir, ['s-p'])],
-      files: { 's-p': { id: 's-p', cwd: dir } },
+      entities,
+      files,
+      persistence: makeLegacyPersistence(entities, files),
       presets: [{ id: 'a' }, { id: 'b' }],
     });
     const { status, body } = await callApi(handler, 'preset-migrate', {
@@ -270,9 +409,12 @@ describe('preset-migrate', () => {
   it('migrate 同预设为 no-op（migrated:false）', async () => {
     const dir = await realDir('browser-t3-pm-noop-');
     writeSession(dir, 's-q', { agentPreset: 'a' }, []);
+    const entities = [makeEntity('w1', dir, ['s-q'])];
+    const files = { 's-q': { id: 's-q', cwd: dir } };
     const { handler } = makeCtx({
-      entities: [makeEntity('w1', dir, ['s-q'])],
-      files: { 's-q': { id: 's-q', cwd: dir } },
+      entities,
+      files,
+      persistence: makeLegacyPersistence(entities, files),
       presets: [{ id: 'a' }, { id: 'b' }],
     });
     const { body } = await callApi(handler, 'preset-migrate', {
@@ -283,7 +425,7 @@ describe('preset-migrate', () => {
   });
 
   it('migrate 缺少参数 / 未知预设返回 ok:false', async () => {
-    const { handler } = makeCtx({ entities: [], files: {}, presets: [{ id: 'a' }] });
+    const { handler } = makeCtx({ entities: [], presets: [{ id: 'a' }] });
     const missing = await callApi(handler, 'preset-migrate', { sessionId: 's' });
     assert.equal(missing.body.ok, false);
     assert.equal(missing.body.error, 'sessionId and toPreset required');

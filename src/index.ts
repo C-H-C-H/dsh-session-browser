@@ -270,31 +270,21 @@ async function handleDelete(ctx: Context, payload: Record<string, unknown>) {
 }
 
 /** ------------------------------------------------------------------ Task 3: move / preset-migrate / workspaces.
- * Ported from dsh-session-manager lib/index.js (move flow with artifact
- * migration + accounting swap; migratePreset effective-preset rewrite;
- * listWorkspaces ordered projection). Dropped as unrelated: preset-scan route
- * (+ its scan helpers), the post-boot reconcile effect, legacy commented move.
+ * move 已重写为 fork 式迁移（0.1.7 公开 API）：observeSession 读源会话 →
+ * agents.create（回退 sessions.create）按目标 cwd 建新会话并复制事件种子 →
+ * registry 记账切换 → 旧会话 archiveSession(stopActivity:true) 归档保留。
+ * migratePreset / listWorkspaces 仍是 session-manager 移植旧实现（Task 4/8 的活）。
  * Live registries use ctx.sessions / ctx.agents property access like the
- * original (hence the inject entries); persistence/presets stay ctx.get.
+ * original (hence the inject entries); sessionQuery/persistence/presets stay
+ * ctx.get lazy accesses and are intentionally NOT listed.
  */
 
-/** User-facing error string that never throws and never leaks internals. Ported from session-manager. */
-function safeErrorMessage(error: unknown): string {
-  if (error === null || error === undefined) return `<nullish:${typeof error}>`
-  if (typeof error === 'string') return error
-  if (typeof error === 'object') {
-    const obj = error as { message?: unknown; code?: unknown }
-    if (typeof obj.message === 'string' && obj.message.length > 0) return obj.message
-    if (typeof obj.code === 'string' && obj.code.length > 0) return `[code=${obj.code}]`
-  }
-  try { return JSON.stringify(error) } catch { return String(error) }
-}
-
 /**
- * Hex nonce for temp-file names. session-manager uses node:crypto randomBytes;
- * this host keeps the waived node:* surface to fs/promises + path (R5), so a
- * Math.random nonce is used instead — uniqueness is best-effort either way
- * because writeTempFile opens with 'wx' (exclusive) and rename failures roll back.
+ * Hex nonce for temp-file names and fork-style move child ids.
+ * session-manager uses node:crypto randomBytes; this host keeps the waived
+ * node:* surface to fs/promises + path (R5), so a Math.random nonce is used
+ * instead — uniqueness is best-effort either way because writeTempFile opens
+ * with 'wx' (exclusive) and rename failures roll back.
  */
 function randomHex(bytes: number): string {
   let out = ''
@@ -328,59 +318,10 @@ function listWorkspaces(ctx: Context): unknown[] {
 }
 
 /**
- * Quiet a live session + agent so the artifact is quiesced WITHOUT removing it
- * from the live store. Ported from session-manager `quietLive` verbatim (see
- * original comments): use before any operation that might still fail, so a
- * failed migration never fires `session/disposed` while durable state is unchanged.
- */
-async function quietLive(ctx: Context, sessionId: string): Promise<boolean> {
-  const liveSessions: any = (ctx as any).sessions
-  const liveAgents: any = (ctx as any).agents
-  const session = liveSessions?.get?.(sessionId)
-  const agent = liveAgents?.get?.(sessionId)
-  const wasLive = session !== undefined || agent !== undefined
-
-  if (agent !== undefined) {
-    // Complete cancellation before the session is detached (see original: the
-    // old timeout-based scope disposal could leave the write path owning this
-    // Session while the artifact had already been moved).
-    agent.cancel({ kind: 'disposed' })
-    if (typeof agent.whenIdle === 'function') await agent.whenIdle()
-    if (typeof agent.scope?.dispose === 'function') await agent.scope.dispose()
-    // Drop the stale registry entry only after the driver has quiesced.
-    try { liveAgents.store?.delete?.(sessionId) } catch { /* best-effort */ }
-  }
-
-  if (session !== undefined) {
-    // Flush buffered events to disk (final drain) — the persistence write-path
-    // turns this into a settled retirement, so the upcoming readRaw() sees a
-    // quiesced artifact. The store entry itself is NOT touched.
-    try { await liveSessions.flush(session) } catch { /* best-effort */ }
-  }
-  return wasLive
-}
-
-/**
- * Detach the live store entry — the only call site that fires
- * `session/disposed` (relayed as `host/session-removed`). Ported from
- * session-manager `releaseLiveSession`: call only AFTER every durable
- * side-effect of the migration is committed.
- */
-async function releaseLiveSession(ctx: Context, sessionId: string): Promise<void> {
-  const liveSessions: any = (ctx as any).sessions
-  try {
-    const entry = liveSessions?.store?.get?.(sessionId)
-    if (entry !== undefined && typeof entry.detach === 'function') {
-      entry.detach()
-      await sleep(250) // let the write-behind retirement settle
-    }
-  } catch { /* best-effort */ }
-}
-
-/**
  * Durable temp-file write next to its final target. Ported from session-manager
  * `writeTempFile` (randomBytes → randomHex, see above). Returns the temp path;
  * the caller publishes it with a rename once the coast is clear.
+ * (Kept for preset-migrate until Task 4 rewrites it.)
  */
 async function writeTempFile(finalPath: string, data: Buffer): Promise<string> {
   const temp = `${finalPath}.${randomHex(6)}.tmp`
@@ -398,6 +339,7 @@ async function writeTempFile(finalPath: string, data: Buffer): Promise<string> {
  * Encode the moved artifact in the backend's own physical layout: plain JSONL,
  * or zstd frames whose FIRST frame is exactly the header line (the reader's
  * assertZstdHeaderFrame / readFirstZstdLine contract). Ported verbatim.
+ * (Kept for preset-migrate until Task 4 rewrites it.)
  */
 async function encodeArtifact(headerLine: string, rest: string, isZstd: boolean): Promise<Buffer> {
   if (!isZstd) return Buffer.from(`${headerLine}\n${rest}`, 'utf8')
@@ -415,21 +357,23 @@ async function encodeArtifact(headerLine: string, rest: string, isZstd: boolean)
 }
 
 /**
- * TRUE cross-workspace move: re-home the stored cwd, migrate the artifact, then
- * swap accounting. Ported from session-manager `moveSession` — history, titles,
- * archive-set membership and lineage are preserved; only the working directory
- * the session belongs to changes. Throws an Error with a readable (verbatim
- * Chinese) message on every failure path; the artifact is restored (or its
- * location reported) whenever a mid-move step fails.
+ * Fork-style cross-workspace move using only 0.1.7 public APIs.
+ * Confirmed semantics: move = keep the source session archived + create a new
+ * session at the target cwd + copy the event seed + switch workspace
+ * accounting; the session id changes.
+ * Steps: validate target → observeSession (failure → session-not-found 中文错)
+ * → subagent refuse → same-dir no-op → stop live agent (cancel + whenIdle +
+ * flush; internal store / prepare / enter are never touched) → agents.create
+ * the new session (meta.cwd = target path, seed = source events; falls back
+ * to sessions.create) → accounting switch (detach old / attach new) →
+ * archive the source (stopActivity:true) → return { ok, sessionId:<newId>,
+ * moved, fromWorkspaceIds, toWorkspaceId, toWorkspaceTitle, archivedSourceId,
+ * wasLive }.
  */
 async function moveSession(ctx: Context, sessionId: string, targetWorkspaceId: string): Promise<Record<string, unknown>> {
   const registry: any = (ctx as any).workspaceRegistry
   const logger: any = (ctx as any).logger
-  const persistence: any = ctx.get('sessionPersistence')
-  if (persistence === undefined) throw new Error('sessionPersistence 服务不可用')
-  if (typeof persistence.readRaw !== 'function' || typeof persistence.loadStored !== 'function') {
-    throw new Error('当前持久化后端不支持 readRaw/loadStored，无法跨工作区移动')
-  }
+  const sessionQuery: any = ctx.get('sessionQuery')
 
   const target = registry.list().find((entity: any) => entity.id === targetWorkspaceId)
   if (target === undefined) {
@@ -439,285 +383,116 @@ async function moveSession(ctx: Context, sessionId: string, targetWorkspaceId: s
   }
   const targetPath = target.path // canonical (realpath) workspace directory
 
-  // ---- 0. pre-flight: the session must exist on disk -------------------
-  const storedHeaders = await persistence.list()
-  const storedHeader = storedHeaders.find((header: any) => header.id === sessionId)
-  if (storedHeader === undefined) {
-    const error = new Error(
-      `会话 ${sessionId} 没有磁盘记录（不存在，或是一个尚未发送任何消息的空白会话），无法移动`
-    ) as Error & { code?: string }
+  // ---- 0. observe the source session via the public query face ----
+  if (sessionQuery === undefined || typeof sessionQuery.observeSession !== 'function') {
+    throw new Error('sessionQuery 服务不可用')
+  }
+  let observed: any
+  try {
+    observed = await sessionQuery.observeSession(sessionId)
+  } catch {
+    const error = new Error(`会话 ${sessionId} 不存在，无法移动`) as Error & { code?: string }
     error.code = 'session-not-found'
     throw error
   }
-  if (storedHeader.origin === 'subagent') {
+  const sourceHeader = observed?.header
+  const sourceEvents: any[] = Array.isArray(observed?.events) ? [...observed.events] : []
+  try {
+    if (typeof observed?.[Symbol.dispose] === 'function') observed[Symbol.dispose]()
+  } catch { /* best-effort: the observation lease is caller-owned */ }
+
+  if (sourceHeader?.origin === 'subagent') {
     const error = new Error('子代理（subagent）会话不支持跨工作区移动') as Error & { code?: string }
     error.code = 'subagent-unsupported'
     throw error
   }
 
-  // No-op when the header's cwd already resolves to the target directory.
-  if (storedHeader.cwd !== undefined) {
+  // No-op when the source cwd already resolves to the target directory.
+  if (typeof sourceHeader?.cwd === 'string') {
     let currentCanonical: string | undefined
     try {
-      currentCanonical = await realpath(storedHeader.cwd)
-    } catch { /* old directory gone — the move below re-homes it */ }
+      currentCanonical = await realpath(sourceHeader.cwd)
+    } catch { /* old directory gone — the fork below re-homes it */ }
     if (currentCanonical === targetPath) {
       return { ok: true, sessionId, moved: false, message: '会话已属于目标工作区' }
     }
   }
 
-  // ---- 1. quiet the live session WITHOUT removing it from store ----
-  const wasLive = await quietLive(ctx, sessionId)
-
-  // ---- 2. read the artifact verbatim and rewrite the header cwd --------
-  const raw = await persistence.readRaw(sessionId)
-  if (raw === undefined) {
-    throw new Error('读取会话工件失败：readRaw 未找到会话文件')
-  }
-  const meta = raw.meta
-  const newlineAt = raw.content.indexOf('\n')
-  if (newlineAt === -1) throw new Error('会话工件缺少头行，数据可能损坏')
-  const headerText = raw.content.slice(0, newlineAt)
-  const rest = raw.content.slice(newlineAt + 1)
-
-  let headerObject: any
-  try {
-    headerObject = JSON.parse(headerText)
-  } catch (error) {
-    throw new Error(`会话工件头行无法解析: ${String(error)}`)
-  }
-  if (headerObject.id !== sessionId) throw new Error('会话工件头行 id 与请求不符，拒绝移动')
-  headerObject.cwd = targetPath
-  const newHeaderLine = JSON.stringify(headerObject)
-
-  const newLocation = persistence.locate({ ...meta, cwd: targetPath })
-  const oldLocation = persistence.locate(meta) // === the file readRaw just read
-  if (newLocation === undefined || oldLocation === undefined) {
-    throw new Error('持久化后端无法定位会话工件路径')
-  }
-  const bytes = await encodeArtifact(
-    newHeaderLine,
-    rest,
-    newLocation.path.endsWith('.zstd')
-  )
-
-  // ---- 3. publish the new artifact; never leave a duplicate id ---------
-  await mkdir(dirname(newLocation.path), { recursive: true })
-  const tempNew = await writeTempFile(newLocation.path, bytes)
-
-  let oldHidden: string | undefined
-  try {
-    // Hide the old artifact first (rename inside its own directory):
-    // scans only see exact `session.jsonl[.zstd]` names, so between the
-    // two renames exactly one log is visible instead of a duplicate id
-    // (a duplicate would make the backend's list()/findLog() throw).
-    oldHidden = `${oldLocation.path}.${randomHex(6)}.tmp`
-    await rename(oldLocation.path, oldHidden)
-  } catch (error) {
-    await rm(tempNew, { force: true })
-    throw new Error(`移动失败（无法隐藏旧会话工件，已取消，会话保持原状）: ${String(error)}`)
-  }
-
-  try {
-    await rename(tempNew, newLocation.path)
-  } catch (error) {
-    let restored = false
-    try {
-      await rename(oldHidden as string, oldLocation.path)
-      restored = true
-    } catch { /* reported below */ }
-    await rm(tempNew, { force: true })
-    if (!restored) {
-      throw new Error(
-        `移动失败且旧工件回滚失败——原数据保留在 ${oldHidden}，请手动恢复: ${String(error)}`
-      )
-    }
-    throw new Error(`移动失败（已回滚，会话保持原状）: ${String(error)}`)
-  }
-
-  // Cleanup of the old artifact and its parent directory is DEFERRED to the
-  // very end of moveSession (right before success-return) — see original: any
-  // error thrown before that point must still find oldHidden alive for restore.
-
-  // ---- 4. swap workspace accounting through the registry's own path ----
-  let stored: any
-  try {
-    stored = await persistence.loadStored(sessionId)
-    if (stored === undefined || stored.meta.cwd !== targetPath) {
-      throw new Error('迁移后的会话日志读取校验失败')
-    }
-  } catch (error) {
-    throw new Error(`工件已迁移至 ${newLocation.path}，但记账前校验失败: ${String(error)}`)
-  }
-
-  // Remove the live entry from the store BEFORE constructing the placeholder
-  // so prepare() does not throw "session already exists" — silently (the
-  // original flips the announce latch; here detach() is best-effort silent in
-  // the same spirit: no row flicker while the disk migration commits).
+  // ---- 1. stop the live agent/session WITHOUT touching internal store ----
   const liveSessions: any = (ctx as any).sessions
-  const originalEntry = liveSessions?.store?.get?.(sessionId)
-  if (originalEntry !== undefined && typeof originalEntry.detach === 'function') {
-    try {
-      originalEntry.detach()
-    } catch (error) {
-      logger.warn(`session-manager: pre-move detach of original entry failed for "${sessionId}": ${String(error)}`)
-    }
+  const liveAgents: any = (ctx as any).agents
+  const liveSession = liveSessions?.get?.(sessionId)
+  const liveAgent = liveAgents?.get?.(sessionId)
+  const wasLive = liveSession !== undefined || liveAgent !== undefined
+  if (liveAgent !== undefined) {
+    try { liveAgent.cancel({ kind: 'disposed' }) } catch { /* best-effort */ }
+    if (typeof liveAgent.whenIdle === 'function') await liveAgent.whenIdle()
   }
-  let detachPlaceholder: (() => void) | null = null
-  try {
-    const placeholder = liveSessions.prepare(sessionId, {
-      seedSource: 'persistence',
-      seed: stored.events,
-      meta: stored.meta
-    })
-    detachPlaceholder = liveSessions.enter(placeholder)
-  } catch (error) {
-    // Disk state at this point: newLocation holds the new artifact, oldHidden
-    // holds the original. Undo both (new first, so the same id never exists
-    // twice on disk during the swap).
-    let newRemoved = true
-    try { await rm(newLocation.path, { force: true }) }
-    catch { newRemoved = false }
-    try { await rm(dirname(newLocation.path), { recursive: true, force: true }) }
-    catch { /* best-effort */ }
-    let restored = false
-    try { await rename(oldHidden as string, oldLocation.path); restored = true }
-    catch { /* reported below */ }
-    if (!restored) {
-      throw new Error(
-        `构造校验失败且旧工件回滚失败——原数据保留在 ${oldHidden}，请手动恢复: ${safeErrorMessage(error)}`
-      )
-    }
-    try { await rm(dirname(oldLocation.path), { recursive: true, force: true }) }
-    catch { /* best-effort */ }
-    if (!newRemoved) {
-      throw new Error(
-        `旧工件已回滚但新工件 ${newLocation.path} 仍未清理，请手动删除: ${safeErrorMessage(error)}`
-      )
-    }
-    throw new Error(
-      `工件已迁移至 ${newLocation.path}，但构造校验会话失败（已回滚磁盘，会话保持原状）: ${safeErrorMessage(error)}`
-    )
+  if (liveSession !== undefined) {
+    try { await liveSessions.flush(liveSession) } catch { /* best-effort */ }
   }
 
+  // ---- 2. fork: create the new session at the target cwd with the copied seed ----
+  const newSessionId = `session-${randomHex(8)}`
+  const seed = sourceEvents
+  if (liveAgents !== undefined && typeof liveAgents.create === 'function') {
+    await liveAgents.create({
+      sessionId: newSessionId,
+      meta: { cwd: targetPath },
+      seed,
+    })
+  } else if (liveSessions !== undefined && typeof liveSessions.create === 'function') {
+    await liveSessions.create({
+      sessionId: newSessionId,
+      meta: { cwd: targetPath },
+      seed,
+    })
+  } else {
+    throw new Error('agents/sessions 服务不可用，无法创建新会话')
+  }
+
+  // ---- 3. switch workspace accounting: detach old, attach new ----
   const fromWorkspaceIds: string[] = []
-  // Set by the enqueueOperation callback only when target.attachSession has
-  // durably accepted the new accounting — the broadcast below is gated on this.
-  let attachSucceeded = false
   try {
     await registry.enqueueOperation(async () => {
       for (const entity of registry.list()) {
         if (entity.id === target.id) continue
-        // Raw-record membership: the index-filtered getter would hide stale
-        // accounting exactly where a move must clean it up.
         const rawIds = Array.isArray(entity.record?.sessionIds)
           ? entity.record.sessionIds
           : entity.sessionIds
-        if (rawIds.includes(sessionId)) {
+        const ids = typeof rawIds === 'function' ? rawIds() : rawIds
+        if (Array.isArray(ids) && ids.includes(sessionId)) {
           fromWorkspaceIds.push(entity.id)
           await entity.detachSession(sessionId)
         }
       }
-      await target.attachSession(sessionId)
-      attachSucceeded = true
+      await target.attachSession(newSessionId)
     })
-  } finally {
-    try {
-      // Push a synthetic session/created so the apiproxy broadcast path
-      // forwards host/session-added to every connected mux consumer (see
-      // original: a one-shot fake session object, never detached, so the push
-      // is purely additive). Title projection is re-folded by replaying the
-      // title-relevant events in order.
-      if (attachSucceeded) {
-        const fakeSession = {
-          id: sessionId,
-          header: { ...stored.meta, cwd: targetPath },
-          events: stored.events,
-        }
-        if (Array.isArray(stored.events)) {
-          for (const event of stored.events) {
-            if (event === undefined || event === null) continue
-            if (event.type !== 'session/title' && event.type !== 'user/message') continue
-            try { (ctx as any).emit('session/event', fakeSession, event) }
-            catch (driveError) {
-              logger.warn(`session-manager: post-move session/event drive failed for "${sessionId}" (title may render from fallback until next list pull): ${String(driveError)}`)
-            }
-          }
-        }
-      }
-    } catch { /* best-effort */ }
-    try {
-      if (detachPlaceholder !== null) detachPlaceholder()
-    } catch { /* best-effort */ }
-  }
-
-  // Replay the projection-relevant events BEFORE the live entry is detached, so
-  // every connected client's title cell picks up the new value without the
-  // session/created + session/disposed flicker (see original).
-  try {
-    const reread = await persistence.loadStored(sessionId)
-    if (reread !== undefined && Array.isArray(reread.events)) {
-      const fresh = {
-        id: sessionId,
-        header: { ...reread.meta, cwd: targetPath },
-        events: reread.events
-      }
-      for (const event of reread.events) {
-        if (event === undefined || event === null) continue
-        if (event.type !== 'session/title' && event.type !== 'user/message') continue
-        try { (ctx as any).emit('session/event', fresh, event) } catch { /* best-effort */ }
-      }
-    }
   } catch (error) {
-    logger.warn(`session-manager: post-move event replay failed for "${sessionId}": ${String(error)}`)
+    throw new Error(`新会话已创建（${newSessionId}），但工作区记账切换失败: ${String(error)}`)
   }
 
-  // Fire the final `session/disposed` ONLY here — every other migration step
-  // above has succeeded, so the row's home in the target workspace is durable.
-  await releaseLiveSession(ctx, sessionId)
-
-  // `session/disposed` retires persistence asynchronously. Recover only an
-  // orphaned owner left by older move implementations (see original).
+  // ---- 4. archive the source session (kept; stop its activity) ----
   try {
-    if (typeof persistence.inspect === 'function') await persistence.inspect(sessionId)
-    const states = persistence.states
-    const state = states?.get?.(sessionId)
-    if (state?.owner !== undefined && liveSessions?.get?.(sessionId) === undefined && (ctx as any).agents?.get?.(sessionId) === undefined) {
-      states.delete(sessionId)
-      logger.warn(`session-manager: cleared stale persistence owner after move for "${sessionId}"`)
-    }
+    await registry.archiveSession(sessionId, { stopActivity: true })
   } catch (error) {
-    logger.warn(`session-manager: post-move persistence retirement check failed for "${sessionId}": ${String(error)}`)
+    try { logger?.warn?.(`session-browser: archiving move source "${sessionId}" failed: ${String(error)}`) } catch { /* best-effort */ }
   }
 
-  logger.info(
-    `session-manager: moved "${sessionId}" ` +
-    `${fromWorkspaceIds.length > 0 ? fromWorkspaceIds.join(',') + ' -> ' : ''}${target.id} ` +
-    `(${oldLocation.path} -> ${newLocation.path})`
-  )
-
-  // Success is durable: drop the renamed original artifact and its (possibly
-  // empty) parent directory — any earlier error would have restored from it.
-  try {
-    await rm(oldHidden as string, { force: true })
-  } catch { /* best-effort */ }
-  try {
-    await rm(dirname(oldLocation.path), { recursive: true, force: true })
-  } catch { /* best-effort */ }
+  try { logger?.info?.(`session-browser: moved "${sessionId}" to "${newSessionId}" in ${target.id}`) } catch { /* best-effort */ }
 
   return {
     ok: true,
-    sessionId,
+    sessionId: newSessionId,
+    newSessionId,
     moved: true,
     fromWorkspaceIds,
     toWorkspaceId: target.id,
     toWorkspaceTitle: target.title || target.id,
-    artifactFrom: oldLocation.path,
-    artifactTo: newLocation.path,
+    archivedSourceId: sessionId,
     wasLive
   }
 }
-
 /* === preset-migration (session-manager v0.3.0) === */
 const NL = String.fromCharCode(10)
 
