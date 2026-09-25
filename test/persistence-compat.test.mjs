@@ -34,6 +34,19 @@ describe('readStoredEvents', () => {
     assert.deepEqual(await readStoredEvents(fake, 'a'), [{ seq: 0 }, { seq: 1 }]);
     assert.equal(closed, true);
   });
+  it('open 分支兼容 { events } 对象格式', async () => {
+    const pages = [{ events: [{ seq: 0 }] }, { events: [{ seq: 1 }] }, { events: [] }];
+    let closed = false;
+    const fake = {
+      open: async (id, access) => {
+        assert.equal(id, 'a'); assert.equal(access, 'read');
+        let n = 0;
+        return { read: async () => pages[n++], close: async () => { closed = true; } };
+      },
+    };
+    assert.deepEqual(await readStoredEvents(fake, 'a'), [{ seq: 0 }, { seq: 1 }]);
+    assert.equal(closed, true);
+  });
   it('会话不存在返回 undefined', async () => {
     const fake = { loadStored: async () => undefined };
     assert.equal(await readStoredEvents(fake, 'nope'), undefined);

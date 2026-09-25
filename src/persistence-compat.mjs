@@ -25,7 +25,8 @@ export async function readStoredEvents(persistence, sessionId) {
     try {
       const events = [];
       for (let offset = 0; ; offset += READ_CHUNK) {
-        const slice = await handle.read(offset, READ_CHUNK);
+        const result = await handle.read(offset, READ_CHUNK);
+        const slice = Array.isArray(result) ? result : result?.events;
         if (!slice || slice.length === 0) break;
         for (const ev of slice) events.push(ev);
         // NOTE: no `slice.length < READ_CHUNK` early-break here on purpose:

@@ -7,7 +7,7 @@
  * - `/session-browser/api/list-rounds` — user messages in a session
  * - `/session-browser/api/archive` — `{ sessionId }` → `{ ok: true }`
  * - `/session-browser/api/unarchive` — `{ sessionId }` → `{ ok: true }`
- * - `/session-browser/api/delete` — `{ sessionId }` → `{ ok: true }`
+ * - `/session-browser/api/delete` — `{ sessionId }` → `{ ok: true, result }`
  * - `/session-browser/api/move` — `{ sessionId, targetWorkspaceId }` → `{ ok: true, result }`
  * - `/session-browser/api/preset-migrate` — `{ sessionId, toPreset }` → `{ ok: true, result }`
  * - `/session-browser/api/workspaces` — `{}` → `{ ok: true, result: { workspaces } }`
@@ -171,9 +171,9 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
   const liveAgents: any = ctx.get('agents')
   const session = liveSessions?.get?.(sessionId)
   const agent = liveAgents?.get?.(sessionId)
-  const wasLive = session !== undefined || agent !== undefined
+  const wasLive = session != null || agent != null
 
-  if (agent !== undefined) {
+  if (agent != null) {
     // Stop any running turn (disposed-kind suppresses re-wake).
     try {
       agent.cancel({ kind: 'disposed' })
@@ -185,7 +185,7 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
   }
 
   let detached = false
-  if (session !== undefined) {
+  if (session != null) {
     // Flush buffered events to disk first so the retirement drain is a no-op.
     try {
       await liveSessions.flush(session)
