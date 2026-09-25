@@ -169,16 +169,29 @@ function expandAllSessionOverflows() {
 }
 
 /** ------------------------------------------------------------------ Task 5: row actions.
- * Read of the currently-open session id. Primary is the production shape
- * `ctx.sessions.list.getSnapshot().current` (SessionListSnapshot.current:
- * SessionId|undefined, plain string); the older accessor shapes are kept only
- * as best-effort fallback for host-version variance; unknown shapes yield
- * undefined (callers treat that as "not current").
+ * Read of the currently-open session id. Primary is the production shape:
+ * scan `ctx.sessions.list.getSnapshot().byId` and return the id whose
+ * `sessions.retainInfo(id).getSnapshot().retainedBy.mainView` count is > 0
+ * (0.1.7 retain 语义：mainView 持有即当前打开会话）. The older accessor
+ * shapes are kept only as best-effort fallback for host-version variance;
+ * unknown shapes yield undefined (callers treat that as "not current").
  */
 function currentOpenSessionId(ctx: Context): string | undefined {
   try {
     const svc = (ctx as any).sessions
     if (!svc) return undefined
+    // Production primary: mainView retain count scan over list snapshot byId.
+    try {
+      const byId = svc?.list?.getSnapshot?.()?.byId
+      if (byId && typeof byId === 'object' && typeof svc?.retainInfo === 'function') {
+        for (const id of Object.keys(byId)) {
+          try {
+            const cnt = svc.retainInfo(id)?.getSnapshot?.()?.retainedBy?.mainView
+            if (typeof cnt === 'number' && cnt > 0) return id
+          } catch { /* ignore per-id */ }
+        }
+      }
+    } catch { /* ignore */ }
     // Production primary: list snapshot .current is the plain SessionId string
     // (SessionListSnapshot.current: SessionId|undefined).
     try {
@@ -241,6 +254,24 @@ function mapWorkspaceList(list: unknown): Array<{ id: string; name?: string; tit
     .filter((w: { id: string }) => w.id !== '')
 }
 
+// Open a session in the main view (0.1.7 retain 语义）. Preferred path is
+// `uiWorkspace.openSession` (= retain with source 'mainView'); fallback is a
+// direct `sessions.retain(sessionId, { source: 'mainView' })` whose reference
+// is released immediately (retain+release = open without leaking a hold).
+async function openSessionById(ctx: Context, sessionId: string): Promise<void> {
+  try {
+    const opener = (ctx as any).uiWorkspace?.openSession
+    if (typeof opener === 'function') {
+      await opener.call((ctx as any).uiWorkspace, sessionId)
+      return
+    }
+  } catch { /* fall through to retain */ }
+  try {
+    const ref = await (ctx as any).sessions?.retain?.(sessionId, { source: 'mainView' })
+    try { ref?.release?.() } catch { /* ignore */ }
+  } catch { /* ignore */ }
+}
+
 // Dual-refresh for move: immediate workspaces.refresh + sessions.refresh with
 // reopen-if-current. Shared by the Panel row action (Task 5) and the header
 // action (Task 6); each caller schedules the 250/900ms delayed legs itself
@@ -248,7 +279,7 @@ function mapWorkspaceList(list: unknown): Array<{ id: string; name?: string; tit
 async function refreshMovedSession(ctx: Context, sessionId: string, wasCurrent: boolean): Promise<void> {
   try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
   if (wasCurrent) {
-    try { if (sessionsStoreById(ctx)[sessionId] !== undefined) (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+    try { if (sessionsStoreById(ctx)[sessionId] !== undefined) await openSessionById(ctx, sessionId) } catch { /* ignore */ }
   }
 }
 
@@ -297,7 +328,7 @@ async function ensureWindowCovers(sessions: any, sessionId: string, seq: number,
 }
 
 async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string): Promise<void> {
-  try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
+  try { await openSessionById(ctx, sessionId) } catch { /* ignore */ }
   // Phase 1: page the virtualized event window backwards until it covers the
   // target seq, so the anchor element actually renders. No-op fallback on
   // hosts without SessionFace.loadThrough (e.g. desktop 2.0.4).
@@ -459,10 +490,11 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     const wasCurrent = currentOpenSessionId(ctx) === s.sessionId
     const res: any = await callApi('delete', { sessionId: s.sessionId })
     if (!res?.ok) { setNotice(apiError(res, '删除会话失败')); setNoticeOk(false); return }
-    // Same rule as session-manager: deleting the open session clears it so the
-    // main UI does not show a removed session.
+    // Same rule as session-manager: deleting the open session converges via
+    // sessions store refresh (0.1.7 ISessions has no clear) so the main UI
+    // does not show a removed session.
     if (wasCurrent) {
-      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+      try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
     }
     if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
     reloadSessions(tab)
@@ -470,24 +502,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   const onMigrate = async (sessionId: string, toPreset: string): Promise<void> => {
     setNotice(''); setNoticeOk(false)
-    const wasCurrent = currentOpenSessionId(ctx) === sessionId
     const res: any = await callApi('preset-migrate', { sessionId, toPreset })
     if (!res?.ok) { setNotice(apiError(res, '迁移预设失败')); setNoticeOk(false); return }
     setNotice('迁移成功'); setNoticeOk(true)
-    try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
     try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
-    if (wasCurrent) {
-      try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
-    }
     reloadSessions(tab)
     // Single 250ms delayed baseline (no 900ms leg — Task 3 record).
     setTimeout(() => {
-      refreshSessionsStore(ctx).then(() => {
-        try { (ctx as any).sessions?.noteAgentPreset?.(sessionId, toPreset) } catch { /* ignore */ }
-        if (wasCurrent) {
-          try { (ctx as any).sessions?.open?.(sessionId) } catch { /* ignore */ }
-        }
-      })
+      refreshSessionsStore(ctx)
     }, 250)
   }
 
@@ -658,7 +680,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                       } catch { /* ignore */ }
                       // Expand all collapsed session overflow buttons in sidebar
                       expandAllSessionOverflows()
-                      try { ctx.sessions.open(s.sessionId) } catch { /* ignore */ }
+                      void openSessionById(ctx, s.sessionId)
                     },
                   },
                     createElement('div', { className: 'ssb_sessionTitle' }, s.title || '(未命名)'),
@@ -1033,10 +1055,11 @@ function HeaderAction({ ctx, sessionId }: { ctx: Context; sessionId: string }) {
     const wasCurrent = currentOpenSessionId(ctx) === id
     const res: any = await callApi('delete', { sessionId: id })
     if (!res?.ok) throw new Error(apiError(res, '删除会话失败'))
-    // Same rule as session-manager: deleting the open session clears it so the
-    // main UI does not show a removed session.
+    // Same rule as session-manager: deleting the open session converges via
+    // sessions store refresh (0.1.7 ISessions has no clear) so the main UI
+    // does not show a removed session.
     if (wasCurrent) {
-      try { (ctx as any).sessions?.clear?.() } catch { /* ignore */ }
+      try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
     }
     try { await Promise.allSettled([refreshWorkspacesStore(ctx), refreshSessionsStore(ctx)]) } catch { /* ignore */ }
   })
@@ -1167,6 +1190,6 @@ export function apply(ctx: Context) {
   ))
   slots.inject('conversation.session.header.actions', () => slots.register(
     { name: 'conversation.session.header.actions', id: 'session-manager-header', order: 40 },
-    (slotProps: any) => createElement(HeaderAction, { ctx, sessionId: slotProps?.sessionId })
+    (slotProps: any) => createElement(HeaderAction, { ctx, ...slotProps })
   ))
 }
