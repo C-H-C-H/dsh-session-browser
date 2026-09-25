@@ -1031,6 +1031,7 @@ async function listRounds(ctx: Context, payload: Record<string, unknown>) {
         rounds.push({
           seq: event.seq,
           eventId: data.id ?? event.seq,
+          messageId: typeof data.id === 'string' ? data.id : undefined,
           content: content.length > 200 ? content.slice(0, 200) + '…' : content,
           time: event.time,
           turnIndex: turnIndex++,
