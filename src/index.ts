@@ -122,38 +122,23 @@ async function readStoredEvents(persistence: any, sessionId: string): Promise<an
 /** ------------------------------------------------------------------ route handlers */
 
 /**
- * Add one id to the registry-global archive set (durable, serialized).
- * Symmetric mirror of session-manager `unarchiveSession`: idempotent, writes
- * go through `enqueueOperation` + `setState` so a restart keeps the state.
+ * Archive via the workspaceRegistry official method (durable, serialized
+ * inside the registry; idempotent for already-archived ids).
  */
 async function archiveSession(ctx: Context, sessionId: string): Promise<void> {
   const registry: any = ctx.get('workspaceRegistry')
-  if (registry === undefined || typeof registry.enqueueOperation !== 'function') throw new Error('workspaceRegistry 服务不可用')
-  await registry.enqueueOperation(async () => {
-    const state = registry.requireState()
-    if (state.archivedSessionIds.includes(sessionId)) return
-    await registry.setState({
-      ...state,
-      archivedSessionIds: [...state.archivedSessionIds, sessionId],
-    })
-  })
+  if (registry === undefined || typeof registry.archiveSession !== 'function') throw new Error('workspaceRegistry 服务不可用')
+  await registry.archiveSession(sessionId)
 }
 
 /**
- * Remove one id from the registry-global archive set (durable, serialized).
- * Ported from session-manager `unarchiveSession` (ctx.get replaces ctx property).
+ * Unarchive via the workspaceRegistry official method (idempotent, also for
+ * ids whose session is already gone).
  */
 async function unarchiveSession(ctx: Context, sessionId: string): Promise<void> {
   const registry: any = ctx.get('workspaceRegistry')
-  if (registry === undefined || typeof registry.enqueueOperation !== 'function') throw new Error('workspaceRegistry 服务不可用')
-  await registry.enqueueOperation(async () => {
-    const state = registry.requireState()
-    if (!state.archivedSessionIds.includes(sessionId)) return
-    await registry.setState({
-      ...state,
-      archivedSessionIds: state.archivedSessionIds.filter((id: string) => id !== sessionId),
-    })
-  })
+  if (registry === undefined || typeof registry.unarchiveSession !== 'function') throw new Error('workspaceRegistry 服务不可用')
+  await registry.unarchiveSession(sessionId)
 }
 
 /**

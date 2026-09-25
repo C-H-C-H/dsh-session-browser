@@ -44,6 +44,16 @@ function makeCtx({ ids, archivedIds, live }) {
     requireState: () => state,
     enqueueOperation: async (fn) => fn(),
     setState: async (next) => { Object.assign(state, next); },
+    // workspaceRegistry 官方方法（0.1.7）：host 改调 registry.archiveSession /
+    // registry.unarchiveSession，不再手工 enqueueOperation + setState。
+    archiveSession: async (sid) => {
+      if (state.archivedSessionIds.includes(sid)) return;
+      state.archivedSessionIds = [...state.archivedSessionIds, sid];
+    },
+    unarchiveSession: async (sid) => {
+      if (!state.archivedSessionIds.includes(sid)) return;
+      state.archivedSessionIds = state.archivedSessionIds.filter((id) => id !== sid);
+    },
   };
   const persistence = {
     list: async () => [...store.values()]
