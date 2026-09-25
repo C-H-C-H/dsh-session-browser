@@ -20,6 +20,7 @@ interface SessionItem {
 interface RoundItem {
   seq: number
   eventId: number | string
+  messageId?: string
   content: string
   time: number
   turnIndex: number
@@ -327,14 +328,15 @@ async function ensureWindowCovers(sessions: any, sessionId: string, seq: number,
   }
 }
 
-async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string): Promise<void> {
+async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string, messageId?: string): Promise<void> {
   try { await openSessionById(ctx, sessionId) } catch { /* ignore */ }
   // Phase 1: page the virtualized event window backwards until it covers the
   // target seq, so the anchor element actually renders. No-op fallback on
   // hosts without SessionFace.loadThrough (e.g. desktop 2.0.4).
   try { await ensureWindowCovers((ctx as any).sessions, sessionId, eventSeq, 15000) } catch { /* ignore */ }
-  // Phase 2: anchor scroll (unchanged behavior).
-  const anchorKey = `13:input-message${eventId}`
+  // Phase 2: anchor scroll. Prefer the message id (engine key `13:input-message<id>`
+  // where id is event.data.id); fall back to the legacy eventId (seq) shape.
+  const anchorKey = `13:input-message${messageId ?? eventId}`
   let attempts = 0
   const tryScroll = () => {
     const el = document.querySelector(`[data-chat-anchor-key="${anchorKey}"]`)
@@ -719,7 +721,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                   ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
                   : rounds.map(r => {
                       const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
-                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId)
+                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId, r.messageId)
                       else itemProps.style = { cursor: 'default' }
                       return createElement('div', itemProps,
                         createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
