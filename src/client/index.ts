@@ -33,8 +33,8 @@ const CSS = `
    In extended/advanced mode the Desktop's own CSS (with !important) overrides this. */
 [data-slot="sidebar.footer.action"]{display:flex!important;flex-direction:column;gap:6px;min-width:0;width:100%;max-height:min(40vh,240px);overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 [data-slot="sidebar.footer.action"]>*{flex:none;min-width:0}
-.ssb_root{box-sizing:border-box;position:relative;display:flex;align-items:center;justify-content:center;flex:none;width:100%}
-.ssb_button{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0 10px;font-size:12px;line-height:18px;white-space:nowrap}
+.ssb_root{box-sizing:border-box;position:relative;display:flex;align-items:center;justify-content:flex-start;flex:none;width:100%}
+.ssb_button{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:flex-start;gap:6px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0 10px;font-size:12px;line-height:18px;white-space:nowrap}
 .ssb_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .ssb_button svg{flex:none}
 .ssb_panel{position:fixed;z-index:2147483000;width:560px;height:480px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;background:var(--dsw-specific-tip);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.16);overflow:hidden;display:flex;flex-direction:column;font-family:Inter,var(--dsw-font-family)}
@@ -330,6 +330,18 @@ async function ensureWindowCovers(sessions: any, sessionId: string, seq: number,
 
 async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string, messageId?: string): Promise<void> {
   try { await openSessionById(ctx, sessionId) } catch { /* ignore */ }
+  // Wait for the target session to become the active one in the main view FIRST.
+  const waitForActiveSession = async (): Promise<boolean> => {
+    const deadline = Date.now() + 10000
+    while (Date.now() < deadline) {
+      try {
+        if (currentOpenSessionId(ctx) === sessionId) return true
+      } catch { /* ignore */ }
+      try { await new Promise((resolve) => setTimeout(resolve, 100)) } catch { return false }
+    }
+    return false
+  }
+  await waitForActiveSession()
   // Phase 1: page the virtualized event window backwards until it covers the
   // target seq, so the anchor element actually renders. No-op fallback on
   // hosts without SessionFace.loadThrough (e.g. desktop 2.0.4).
@@ -555,6 +567,58 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     window.addEventListener('mouseup', onUp)
   }
 
+  const onWinResizeStart = (e: any) => {
+    if (e.button !== 0) return
+    try { e.preventDefault() } catch { /* ignore */ }
+    const startX = e.clientX
+    const startY = e.clientY
+    const panelEl = document.querySelector('.ssb_panel') as HTMLElement | null
+    if (!panelEl) return
+    const startW = panelEl.offsetWidth
+    const startH = panelEl.offsetHeight
+    const minW = 400
+    const minH = 300
+    const maxW = window.innerWidth - 16
+    const maxH = window.innerHeight - 16
+    const onMove = (ev: MouseEvent) => {
+      const nextW = Math.max(minW, Math.min(maxW, startW + (ev.clientX - startX)))
+      const nextH = Math.max(minH, Math.min(maxH, startH + (ev.clientY - startY)))
+      panelEl.style.width = nextW + 'px'
+      panelEl.style.height = nextH + 'px'
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  const onHeaderMouseDown = (e: any) => {
+    if (e.button !== 0) return
+    if (e.target?.closest?.('button, select, input')) return
+    try { e.preventDefault() } catch { /* ignore */ }
+    const panelEl = document.querySelector('.ssb_panel') as HTMLElement | null
+    if (!panelEl) return
+    const startX = e.clientX
+    const startY = e.clientY
+    const rect = panelEl.getBoundingClientRect()
+    const startLeft = rect.left
+    const startTop = rect.top
+    const onMove = (ev: MouseEvent) => {
+      const nextLeft = Math.max(8, Math.min(window.innerWidth - panelEl.offsetWidth - 8, startLeft + (ev.clientX - startX)))
+      const nextTop = Math.max(8, Math.min(window.innerHeight - panelEl.offsetHeight - 8, startTop + (ev.clientY - startY)))
+      panelEl.style.left = nextLeft + 'px'
+      panelEl.style.top = nextTop + 'px'
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   const toolBtn = (label: string, disabled: boolean, onPress: () => void) =>
     createElement('button', {
       key: label,
@@ -601,8 +665,8 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
     createElement('div', { key: 'panel', className: 'ssb_panel', style: panelStyle, role: 'dialog', 'aria-label': '会话浏览' },
-      createElement('div', { key: 'header', className: 'ssb_header' },
-        createElement('div', { key: 'titleGroup', style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 } },
+      createElement('div', { key: 'header', className: 'ssb_header', onMouseDown: onHeaderMouseDown },
+        createElement('div', { key: 'titleGroup', style: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0, flex: 1, cursor: 'move' } },
           createElement('span', { className: 'ssb_headerTitle' }, '会话浏览'),
           createElement('div', {
             key: 'tabs',
@@ -730,6 +794,25 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                     })
           )
         ),
+        // Window resize handle (bottom-right corner)
+        createElement('div', {
+          key: 'winResize',
+          role: 'separator',
+          'aria-orientation': 'both',
+          'aria-label': '调整窗口大小',
+          title: '拖动调整窗口大小',
+          onMouseDown: onWinResizeStart,
+          style: {
+            position: 'absolute',
+            right: 0,
+            bottom: 0,
+            width: '16px',
+            height: '16px',
+            cursor: 'se-resize',
+            background: 'linear-gradient(-45deg, transparent 50%, var(--dsw-alias-border-l2) 50%, var(--dsw-alias-border-l2) 60%, transparent 60%)',
+            zIndex: 10,
+          },
+        }),
         moveTarget
           ? createElement('div', {
               key: 'moveDlg',
@@ -834,7 +917,7 @@ function SidebarButton({ ctx }: { ctx: Context }) {
       'aria-label': '会话浏览',
       'aria-expanded': open,
       onClick: () => setOpen(true),
-    }, [browseIcon()]),
+    }, [browseIcon(), createElement('span', null, '会话浏览')]),
     open && createElement(Panel, { key: 'panel', onClose: () => setOpen(false), ctx })
   )
 }
