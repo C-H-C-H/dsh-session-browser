@@ -1280,7 +1280,7 @@ function HeaderAction({ ctx, sessionId }: { ctx: Context; sessionId: string }) {
 
 /** ------------------------------------------------------------------ plugin */
 
-export const inject = ['slots', 'sessions']
+export const inject = ['slots', 'sessions', 'uiWorkspace']
 
 export function apply(ctx: Context) {
   ctx.effect(() => injectStyles(), 'dsh-session-browser: stylesheet')
