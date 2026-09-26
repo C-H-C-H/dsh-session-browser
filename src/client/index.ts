@@ -329,15 +329,30 @@ async function ensureWindowCovers(sessions: any, sessionId: string, seq: number,
 }
 
 async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string, messageId?: string): Promise<void> {
-  try { await openSessionById(ctx, sessionId) } catch { /* ignore */ }
-  // Wait for the target session to become the active one in the main view FIRST.
+  // Open the target session in the main view. NOTE: uiWorkspace.openSession is
+  // synchronous void in 0.1.7 (navigation.ts:199) — do NOT await it (await on a
+  // non-promise still defers one microtask, but more importantly its failure
+  // must not be swallowed before retainInfo converges). Fall back to a direct
+  // retain (also scoped through try/catch).
+  try { (ctx as any).uiWorkspace?.openSession?.(sessionId) } catch { /* ignore: fall through to retain */ }
+  if (typeof (ctx as any).uiWorkspace?.openSession !== 'function') {
+    try {
+      const ref = await (ctx as any).sessions?.retain?.(sessionId, { source: 'mainView' })
+      try { ref?.release?.() } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  }
+  // Wait for the target session to become the active one in the main view.
+  // currentOpenSessionId reads retainInfo(id).retainedBy.mainView, which only
+  // converges after replaceMain's retain lands — for a cold session this can
+  // take a few seconds (remote open + history load). 30s budget here; the
+  // subsequent anchor-scroll loop retries on its own if we time out.
   const waitForActiveSession = async (): Promise<boolean> => {
-    const deadline = Date.now() + 10000
+    const deadline = Date.now() + 30000
     while (Date.now() < deadline) {
       try {
         if (currentOpenSessionId(ctx) === sessionId) return true
       } catch { /* ignore */ }
-      try { await new Promise((resolve) => setTimeout(resolve, 100)) } catch { return false }
+      try { await new Promise((resolve) => setTimeout(resolve, 150)) } catch { return false }
     }
     return false
   }
