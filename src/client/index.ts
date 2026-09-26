@@ -38,7 +38,7 @@ const CSS = `
 .ssb_button{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:flex-start;gap:6px;height:28px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0 10px;font-size:12px;line-height:18px;white-space:nowrap}
 .ssb_button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .ssb_button svg{flex:none}
-.ssb_panel{position:fixed;z-index:2147483000;width:560px;height:480px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;background:var(--dsw-specific-tip);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.16);overflow:hidden;display:flex;flex-direction:column;font-family:Inter,var(--dsw-font-family)}
+.ssb_panel{position:fixed;z-index:2147483000;width:1120px;height:960px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;background:var(--dsw-specific-tip);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.16);overflow:hidden;display:flex;flex-direction:column;font-family:Inter,var(--dsw-font-family)}
 .ssb_header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--dsw-alias-border-l2);flex:none}
 .ssb_headerTitle{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
 .ssb_closeBtn{border:none;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:4px;border-radius:6px;display:flex;align-items:center;justify-content:center}
@@ -476,8 +476,8 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   )
 
   const panelStyle = {
-    left: `${Math.max(8, Math.min((window.innerWidth - 560) / 2, window.innerWidth - 568))}px`,
-    top: `${Math.max(8, Math.min((window.innerHeight - 480) / 2, window.innerHeight - 488))}px`,
+    left: `${Math.max(8, Math.min((window.innerWidth - 1120) / 2, window.innerWidth - 1128))}px`,
+    top: `${Math.max(8, Math.min((window.innerHeight - 960) / 2, window.innerHeight - 968))}px`,
   }
 
   const switchTab = (next: 'active' | 'archived') => {
