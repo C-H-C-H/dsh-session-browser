@@ -668,6 +668,11 @@ async function listRounds(ctx: Context, payload: Record<string, unknown>) {
           seq: event.seq,
           eventId: data.id ?? event.seq,
           messageId: typeof data.id === 'string' ? data.id : undefined,
+          // Engine-owned anchor key (conversationContextKey('input-message', id)
+          // = `13:input-message${id}`); the client uses it verbatim instead of
+          // re-deriving the format. Absent when the event has no string id —
+          // the client then falls back to the legacy seq shape (best-effort).
+          anchorKey: typeof data.id === 'string' ? `13:input-message${data.id}` : undefined,
           content: content.length > 200 ? content.slice(0, 200) + '…' : content,
           time: event.time,
           turnIndex: turnIndex++,

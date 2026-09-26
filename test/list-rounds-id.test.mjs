@@ -65,4 +65,11 @@ describe('list-rounds messageId', () => {
     assert.equal(body.items[0].messageId, 'm-1');
     assert.equal(body.items[1].messageId, undefined);
   });
+
+  it('有 string id 的 round 带引擎 anchorKey，无 id 的为 undefined', async () => {
+    const handler = makeHandler();
+    const { body } = await callListRounds(handler, { sessionId: 's-1' });
+    assert.equal(body.items[0].anchorKey, '13:input-messagem-1');
+    assert.equal(body.items[1].anchorKey, undefined);
+  });
 });

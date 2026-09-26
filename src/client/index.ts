@@ -21,6 +21,7 @@ interface RoundItem {
   seq: number
   eventId: number | string
   messageId?: string
+  anchorKey?: string
   content: string
   time: number
   turnIndex: number
@@ -328,7 +329,7 @@ async function ensureWindowCovers(sessions: any, sessionId: string, seq: number,
   }
 }
 
-async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string, messageId?: string): Promise<void> {
+async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, eventId: number | string, messageId?: string, anchorKey?: string): Promise<void> {
   // Open the target session in the main view. NOTE: uiWorkspace.openSession is
   // synchronous void in 0.1.7 (navigation.ts:199) — do NOT await it (await on a
   // non-promise still defers one microtask, but more importantly its failure
@@ -361,12 +362,13 @@ async function jumpToMessage(ctx: Context, sessionId: string, eventSeq: number, 
   // target seq, so the anchor element actually renders. No-op fallback on
   // hosts without SessionFace.loadThrough (e.g. desktop 2.0.4).
   try { await ensureWindowCovers((ctx as any).sessions, sessionId, eventSeq, 15000) } catch { /* ignore */ }
-  // Phase 2: anchor scroll. Prefer the message id (engine key `13:input-message<id>`
-  // where id is event.data.id); fall back to the legacy eventId (seq) shape.
-  const anchorKey = `13:input-message${messageId ?? eventId}`
+  // Phase 2: anchor scroll. Use the host-provided engine anchorKey verbatim
+  // (conversationContextKey('input-message', id)); fall back to the legacy
+  // locally-derived shape only when the host did not provide one.
+  const resolvedAnchorKey = anchorKey ?? `13:input-message${messageId ?? eventId}`
   let attempts = 0
   const tryScroll = () => {
-    const el = document.querySelector(`[data-chat-anchor-key="${anchorKey}"]`)
+    const el = document.querySelector(`[data-chat-anchor-key="${resolvedAnchorKey}"]`)
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' })
       return
@@ -800,7 +802,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
                   ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
                   : rounds.map(r => {
                       const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
-                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId, r.messageId)
+                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId, r.messageId, r.anchorKey)
                       else itemProps.style = { cursor: 'default' }
                       return createElement('div', itemProps,
                         createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
