@@ -166,7 +166,7 @@ describe('archive / unarchive', () => {
 });
 
 describe('delete', () => {
-  it('delete 后会话不再出现在 list() 输出（含归档成员与工作区记账一并清除）', async () => {
+  it('delete 后会话不再出现在 list() 输出（停放到归档集，工作区记账 detach）', async () => {
     const { handler, state, wsSessionIds, statCalls } = makeCtx({
       ids: ['s-del', 's-keep'], archivedIds: ['s-del'],
     });
@@ -176,7 +176,10 @@ describe('delete', () => {
     assert.equal(body.ok, true);
     assert.equal(body.result?.deleted, true);
     assert.equal(body.result?.artifactRemoved, false);
-    assert.ok(!state.archivedSessionIds.includes('s-del'), '归档集成员应一并清除');
+    // delete 把会话停放进归档集，而不是移出：DSH 侧边栏默认隐藏归档行
+    // （ui-workspace/src/client/tree.ts:251-253），移出等于让它回到侧边栏的
+    // 「未分组」下，正是要避免的现象。
+    assert.ok(state.archivedSessionIds.includes('s-del'), '应停放在归档集，使侧边栏隐藏它');
     assert.ok(!wsSessionIds.includes('s-del'), '工作区记账应 detach');
     assert.ok(statCalls.includes('s-del'), '应经 stat 确认存在');
 
@@ -184,6 +187,10 @@ describe('delete', () => {
     const listIds = listBody.items.map((i) => i.sessionId);
     assert.ok(!listIds.includes('s-del'), '删除后 list() 不应再包含该会话');
     assert.ok(listIds.includes('s-keep'));
+
+    const { body: archivedBody } = await callApi(handler, 'list-sessions', { archived: true });
+    assert.ok(!archivedBody.items.map((i) => i.sessionId).includes('s-del'),
+      '已删除会话也不应混进「已归档」页——它归「已删除」页');
   });
 
   it('delete 存活会话先停 agent 再 detach（cancel + entry.detach 被调用）', async () => {

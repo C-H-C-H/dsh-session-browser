@@ -453,7 +453,13 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
 
   // Workspace accounting + archive-set membership.
   await detachFromWorkspaces(ctx, sessionId)
-  await unarchiveSession(ctx, sessionId)
+  // Park it in the archive set rather than releasing it. DSH's sidebar hides
+  // archived rows by default (ui-workspace/src/client/tree.ts:251-253,
+  // `case 'default': return !archived.has(session.id)`), so unarchiving here
+  // would leave the deleted session sitting under「未分组」in the sidebar. The
+  // trash entry already recorded its original archived flag, and restore puts
+  // that state back, so parking loses nothing.
+  await archiveSession(ctx, sessionId)
 
   // Existence confirmation only (best-effort) — physical artifacts stay
   // with the backend, nothing is removed from disk here.
@@ -556,12 +562,14 @@ async function restoreSession(ctx: Context, sessionId: string): Promise<Record<s
 
   if (attachedTo.length === 0) return { ok: false, error: 'attach-failed' as const }
 
-  // Put the archive state back exactly as it was before the delete.
-  if (entry.archived) {
-    try {
-      await archiveSession(ctx, sessionId)
-    } catch { /* best-effort: session is back, archive flag may lag */ }
-  }
+  // Put the archive state back exactly as it was before the delete. Delete
+  // parks the session in the archive set (so the sidebar hides it), so an
+  // originally-unarchived session must be released again here or it would
+  // return as a hidden archive instead of a normal one.
+  try {
+    if (entry.archived) await archiveSession(ctx, sessionId)
+    else await unarchiveSession(ctx, sessionId)
+  } catch { /* best-effort: session is back, archive flag may lag */ }
 
   await dropTrash(sessionId)
 

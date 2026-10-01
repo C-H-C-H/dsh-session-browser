@@ -215,17 +215,21 @@ describe('restore', () => {
     assert.deepEqual(attachCalls, [['new-0', 's1']]);
   });
 
-  it('未归档会话恢复后不调用 archiveSession', async () => {
+  it('未归档会话恢复后应被移出归档集（还原删除前状态）', async () => {
     const { handler, archiveCalls } = makeCtx({
       headers: [{ id: 's2', cwd: '/ws/p2', createdAt: 1, updatedAt: 2 }],
       archived: [],
       workspaces: [{ id: 'w1', path: '/ws/p2', sessionIds: [] }],
     });
     await callApi(handler, 'delete', { sessionId: 's2' });
+    // delete 把它停放进归档集（使侧边栏隐藏），所以恢复必须反向操作，
+    // 否则它会以"隐藏的归档会话"身份回来。
+    assert.ok(archiveCalls.includes('s2'), 'delete 应停放到归档集');
+
     const { body } = await callApi(handler, 'restore', { sessionId: 's2' });
     assert.equal(body.ok, true);
     assert.equal(body.result.archived, false);
-    assert.ok(!archiveCalls.includes('s2'), '不应把未归档会话变成已归档');
+    assert.ok(archiveCalls.includes('-s2'), '原本未归档的应被移出归档集');
   });
 
   it('会话文件已丢失时报 artifacts-missing，且不静默改挂别处', async () => {
