@@ -582,7 +582,13 @@ async function listDeleted(ctx: Context): Promise<Record<string, unknown>> {
     if (title === undefined) {
       title = ''
       try {
-        const events = await readEventsUntil(persistence, e.sessionId, titleFromEvents)
+        // Read the WHOLE log here, unlike the list-sessions path. `session/title`
+        // is appended when the user renames a conversation, so it sits near the
+        // END of the log — a readEventsUntil that stops at the first user/message
+        // (the fast path used for the live tabs) can never see it, and the trash
+        // list would show "你好" instead of the real name. Trashed sessions are
+        // few and cached, so the full read costs little.
+        const events = await readStoredEvents(persistence, e.sessionId)
         title = (events ? titleFromEvents(events) : undefined) || ''
       } catch { /* ignore */ }
       titleCache.set(key, title)
@@ -990,6 +996,8 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
     // 双向兼容，两种格式都能匹配上 header.id。
     const registry = ctx.get('workspaceRegistry')
     const groupedIds = new Set<string>()
+    // Delete is logical: the log survives, so persistence.list() still yields it.
+    const trashedIds = new Set((await readTrash()).map(e => e.sessionId))
     const addId = (raw: unknown) => {
       if (typeof raw !== 'string' || raw === '') return
       groupedIds.add(raw)
@@ -1007,6 +1015,11 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
     }
     const headers = allHeaders.filter((h: any) => {
       if (h.origin === 'subagent') return false
+      // A logically deleted session is still on disk, so persistence.list()
+      // still returns it — but it has left every registry (delete detached it),
+      // which would drop it into「未分组」and show it in two tabs at once. The
+      // trash file is the authority on "deleted"; exclude those ids here.
+      if (trashedIds.has(h.id)) return false
       if (ungroupedOnly) { if (groupedIds.has(h.id)) return false }
       else if (!groupedIds.has(h.id)) return false
       // 归档分流：已归档页只取交集，未归档页排除已归档 id

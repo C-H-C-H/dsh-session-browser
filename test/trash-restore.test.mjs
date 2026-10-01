@@ -44,9 +44,11 @@ function makeCtx({ headers = [], archived = [], workspaces = [], cwdOf = {} } = 
     list: async () => [...store.values()],
     stat: async (id) => store.get(id),
     open: async (id) => ({
-      read: async (offset) => {
+      // offset 是事件索引，读方按 READ_CHUNK 递增；必须尊重 limit，
+      // 否则 offset 一跳到 READ_CHUNK 就返回空数组，读取提前 break。
+      read: async (offset, limit) => {
         const all = store.get(id)?.events ?? [];
-        return { events: all.slice(offset, offset + 1) };
+        return { events: all.slice(offset, offset + (limit ?? 1)) };
       },
       close: async () => {},
     }),
@@ -234,20 +236,19 @@ describe('restore', () => {
   });
 
   it('attachSession 抛错时如实上报 attach-failed', async () => {
-    const { handler } = makeCtx({
+    const { handler, entities } = makeCtx({
       headers: [{ id: 's1', cwd: '/ws/proj', createdAt: 1, updatedAt: 1 }],
       archived: [],
-      workspaces: [{
-        id: 'w1', path: '/ws/proj', sessionIds: [],
-      }],
+      workspaces: [{ id: 'w1', path: '/ws/proj', sessionIds: ['s1'] }],
     });
-    // 让 attach 失败：覆盖实体的 attachSession
-    const ctx2 = makeCtx({ headers: [{ id: 's1', cwd: '/ws/proj', createdAt: 1, updatedAt: 1 }] });
-    void ctx2;
+    // 让恢复时的 attach 失败：目标工作区拒绝挂载
+    const target = entities.find(e => e.id === 'w1');
+    target.attachSession = async () => { throw new Error('cwd mismatch'); };
     await callApi(handler, 'delete', { sessionId: 's1' });
-    // 正常路径先验证可用
     const { body } = await callApi(handler, 'restore', { sessionId: 's1' });
-    assert.equal(body.ok, true);
+    assert.equal(body.ok, false);
+    assert.equal(body.error, 'attach-failed');
+    assert.match(String(body.detail), /cwd mismatch/, '失败原因要透出给用户');
   });
 
   it('不在 trash 中的会话返回 not-in-trash', async () => {
@@ -262,6 +263,94 @@ describe('restore', () => {
     const { status, body } = await callApi(handler, 'restore', {});
     assert.equal(status, 400);
     assert.equal(body.ok, false);
+  });
+});
+
+describe('已删除会话不应出现在其他页签', () => {
+  // delete 是逻辑删除：日志仍在磁盘上，persistence.list() 照样返回它。
+  // 但它已被 detach 出所有记账，于是「未分组 = 全部 − 有归属」会把它捞进来，
+  // 导致同一个会话同时出现在「未分组」和「已删除」两个页签。
+  it('删除后 list-sessions 不再返回该会话（未归档/未分组页都不出现）', async () => {
+    const { handler } = makeCtx({
+      headers: [{ id: 'g1', cwd: '/ws/p', createdAt: 1, updatedAt: 1 }],
+      archived: [],
+      workspaces: [{ id: 'w1', path: '/ws/p', sessionIds: ['g1'] }],
+    });
+    const before = await callApi(handler, 'list-sessions', {});
+    assert.deepEqual(before.body.items.map(i => i.sessionId), ['g1']);
+
+    await callApi(handler, 'delete', { sessionId: 'g1' });
+
+    const after = await callApi(handler, 'list-sessions', {});
+    assert.deepEqual(after.body.items.map(i => i.sessionId), [],
+      '已删除的会话不得再出现在未归档页');
+    const ungrouped = await callApi(handler, 'list-sessions', { ungrouped: true });
+    assert.deepEqual(ungrouped.body.items.map(i => i.sessionId), [],
+      '已删除的会话不得掉进未分组页');
+  });
+
+  it('未删除但无归属的会话仍应出现在未分组页（别误伤）', async () => {
+    const { handler } = makeCtx({
+      headers: [{ id: 'u1', cwd: '/other', createdAt: 1, updatedAt: 1 }],
+      archived: [],
+      workspaces: [],
+    });
+    const { body } = await callApi(handler, 'list-sessions', { ungrouped: true });
+    assert.deepEqual(body.items.map(i => i.sessionId), ['u1']);
+  });
+
+  it('恢复后该会话重新出现在未归档页', async () => {
+    const { handler } = makeCtx({
+      headers: [{ id: 'g1', cwd: '/ws/p', createdAt: 1, updatedAt: 1 }],
+      archived: [],
+      workspaces: [{ id: 'w1', path: '/ws/p', sessionIds: ['g1'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'g1' });
+    await callApi(handler, 'restore', { sessionId: 'g1' });
+    const after = await callApi(handler, 'list-sessions', {});
+    assert.deepEqual(after.body.items.map(i => i.sessionId), ['g1'],
+      '恢复后应重新可见，否则用户会以为恢复失败');
+    const ungrouped = await callApi(handler, 'list-sessions', { ungrouped: true });
+    assert.deepEqual(ungrouped.body.items.map(i => i.sessionId), []);
+  });
+});
+
+describe('已删除列表的标题（session/title 落在日志末尾）', () => {
+  // titleCache 是模块级的，会跨用例存活；下面两个用例必须用彼此独立的
+  // id/updatedAt，否则会命中前一个用例缓存的空标题，测出假结果。
+  it('重命名过的会话显示 durable 标题，而非首条用户消息', async () => {
+    // session/title 是用户重命名时追加的，位于日志靠后位置。
+    // 若沿用「见到首条 user/message 就停」的限读路径，标题会退化成消息内容。
+    const events = [
+      { type: 'session', seq: 0, data: {} },
+      { type: 'user/message', seq: 1, surfaceOp: 'append', data: { content: '你好' } },
+      { type: 'assistant/message', seq: 2, surfaceOp: 'append', data: { content: '…' } },
+      { type: 'session/title', seq: 3, data: { title: '打招呼与问候开场' } },
+    ];
+    const { handler } = makeCtx({
+      headers: [{ id: 'ttl-a', cwd: '/ws/proj-a', createdAt: 9101, updatedAt: 9101, events }],
+      archived: [],
+      workspaces: [{ id: 'wa', path: '/ws/proj-a', sessionIds: ['ttl-a'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'ttl-a' });
+    const { body } = await callApi(handler, 'list-deleted', {});
+    assert.equal(body.result.items[0].title, '打招呼与问候开场',
+      '必须读到日志末尾的 session/title，而不是首条消息「你好」');
+  });
+
+  it('从未重命名的会话仍回退到首条用户消息', async () => {
+    const events = [
+      { type: 'session', seq: 0, data: {} },
+      { type: 'user/message', seq: 1, surfaceOp: 'append', data: { content: '随便问一句' } },
+    ];
+    const { handler } = makeCtx({
+      headers: [{ id: 'ttl-b', cwd: '/ws/proj-b', createdAt: 9202, updatedAt: 9202, events }],
+      archived: [],
+      workspaces: [{ id: 'wb', path: '/ws/proj-b', sessionIds: ['ttl-b'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'ttl-b' });
+    const { body } = await callApi(handler, 'list-deleted', {});
+    assert.equal(body.result.items[0].title, '随便问一句');
   });
 });
 
