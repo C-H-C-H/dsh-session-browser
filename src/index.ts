@@ -1003,7 +1003,16 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
     const registry = ctx.get('workspaceRegistry')
     const groupedIds = new Set<string>()
     // Delete is logical: the log survives, so persistence.list() still yields it.
-    const trashedIds = new Set((await readTrash()).map(e => e.sessionId))
+    // Ids arrive in two shapes in this profile — persistence headers use the bare
+    // UUID while workspace accounting (and therefore the id the client sends on
+    // delete) may carry a `session-` prefix (see 07-D6.1). Register both forms or
+    // the exclusion silently misses and the session reappears under「未分组」.
+    const trashedIds = new Set<string>()
+    const addTrashed = (raw: string) => {
+      trashedIds.add(raw)
+      if (raw.startsWith('session-')) trashedIds.add(raw.slice('session-'.length))
+    }
+    for (const entry of await readTrash()) addTrashed(entry.sessionId)
     const addId = (raw: unknown) => {
       if (typeof raw !== 'string' || raw === '') return
       groupedIds.add(raw)

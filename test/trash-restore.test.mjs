@@ -358,6 +358,25 @@ describe('已删除列表的标题（session/title 落在日志末尾）', () =>
     const { body } = await callApi(handler, 'list-deleted', {});
     assert.equal(body.result.items[0].title, '随便问一句');
   });
+it('trash 记的是带 session- 前缀的 id 时，也必须过滤掉裸 uuid 的 header', async () => {
+    // 实测回归：本机记账/客户端送来的 id 带 `session-` 前缀，而
+    // persistence.list() 的 header.id 是裸 UUID。直接拿 trash 里的 id 去比
+    // header.id 永远匹配不上 → 已删除会话又出现在「未分组」页。
+    const { handler } = makeCtx({
+      headers: [{ id: 'pfx-1', cwd: '/ws/p', createdAt: 1, updatedAt: 1 }],
+      archived: [],
+      workspaces: [{ id: 'w1', path: '/ws/p', sessionIds: ['session-pfx-1'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'session-pfx-1' });
+    const trash = await readTrashFile();
+    assert.equal(trash[0].sessionId, 'session-pfx-1', 'trash 记的应是客户端送来的形式');
+
+    const ungrouped = await callApi(handler, 'list-sessions', { ungrouped: true });
+    assert.deepEqual(ungrouped.body.items.map(i => i.sessionId), [],
+      '带前缀的 trash 记录也必须命中裸 uuid 的 header');
+    const active = await callApi(handler, 'list-sessions', {});
+    assert.deepEqual(active.body.items.map(i => i.sessionId), []);
+  });
 });
 
 describe('cwd 采集（stat 返回的是 snapshot 而非 header）', () => {
