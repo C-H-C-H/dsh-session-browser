@@ -445,12 +445,16 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     // The deleted tab reads the plugin's own trash, not the session store:
     // those sessions are still on disk but no longer accounted for anywhere.
     if (forTab === 'deleted') {
+      // Clear first: on failure the previous tab's rows would otherwise linger
+      // under the new tab and read as if they belonged to it.
+      setSessions([])
       callApi('list-deleted', {}).then((res: any) => {
         if (!res?.ok) { setNotice(apiError(res, '加载回收站失败')); setNoticeOk(false); return }
         setSessions((res.result?.items ?? []) as SessionItem[])
       })
       return
     }
+    setSessions([])
     callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
       if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
       const items = res.items || []
