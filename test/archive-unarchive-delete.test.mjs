@@ -55,9 +55,12 @@ function makeCtx({ ids, archivedIds, live, agentHasWhenIdle = true }) {
   const statCalls = [];
   const persistence = {
     list: async () => [...store.values()].filter((h) => !deleted.has(h.id)),
+    // 真实形状：SessionPersistenceSnapshot `{ header, revision }`，非 header 本身
     stat: async (sid) => {
       statCalls.push(sid);
-      return deleted.has(sid) ? undefined : store.get(sid);
+      if (deleted.has(sid)) return undefined;
+      const h = store.get(sid);
+      return h === undefined ? undefined : { header: h, revision: 'r1' };
     },
     open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
   };

@@ -388,7 +388,12 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
     }
     const persistence: any = ctx.get('sessionPersistence')
     if (typeof persistence?.stat === 'function') {
-      const header = await persistence.stat(sessionId)
+      // stat() returns a SessionPersistenceSnapshot `{ header, revision, … }`,
+      // NOT the header itself (session-persistence/src/index.ts:50). Reading
+      // `.cwd` off the snapshot silently yields undefined — which is why every
+      // deleted session recorded cwd:"" and restore failed with `no-cwd`.
+      const snapshot = await persistence.stat(sessionId)
+      const header = snapshot?.header
       if (header && typeof header === 'object') {
         cwd = typeof (header as any).cwd === 'string' ? (header as any).cwd : ''
         createdAt = typeof (header as any).createdAt === 'number' ? (header as any).createdAt : 0
@@ -508,7 +513,8 @@ async function restoreSession(ctx: Context, sessionId: string): Promise<Record<s
   const persistence: any = ctx.get('sessionPersistence')
   let header: any = undefined
   try {
-    if (typeof persistence?.stat === 'function') header = await persistence.stat(sessionId)
+    // stat() yields a `{ header, … }` snapshot; the header lives one level down.
+    if (typeof persistence?.stat === 'function') header = (await persistence.stat(sessionId))?.header
   } catch { /* handled below */ }
   if (header === undefined) {
     return { ok: false, error: 'artifacts-missing' as const, detail: '会话文件已不存在，无法恢复' }

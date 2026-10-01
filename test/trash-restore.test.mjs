@@ -42,7 +42,13 @@ function makeCtx({ headers = [], archived = [], workspaces = [], cwdOf = {} } = 
   const archiveCalls = [];
   const persistence = {
     list: async () => [...store.values()],
-    stat: async (id) => store.get(id),
+    // 真实 API：stat() 返回 SessionPersistenceSnapshot `{ header, revision }`，
+    // 不是 header 本身（session-persistence/src/index.ts:50）。fake 必须照此形状，
+    // 否则插件读 `.cwd` 拿到 undefined，测试却全绿。
+    stat: async (id) => {
+      const h = store.get(id);
+      return h === undefined ? undefined : { header: h, revision: 'r1' };
+    },
     open: async (id) => ({
       // offset 是事件索引，读方按 READ_CHUNK 递增；必须尊重 limit，
       // 否则 offset 一跳到 READ_CHUNK 就返回空数组，读取提前 break。
@@ -351,6 +357,35 @@ describe('已删除列表的标题（session/title 落在日志末尾）', () =>
     await callApi(handler, 'delete', { sessionId: 'ttl-b' });
     const { body } = await callApi(handler, 'list-deleted', {});
     assert.equal(body.result.items[0].title, '随便问一句');
+  });
+});
+
+describe('cwd 采集（stat 返回的是 snapshot 而非 header）', () => {
+  it('delete 记录到的 cwd 来自 stat().header.cwd', async () => {
+    // 回归：插件曾直接读 stat() 返回值的 `.cwd`，而真实 API 返回
+    // `{ header, revision }`，于是 cwd 恒为 ''，restore 必然 `no-cwd`。
+    const { handler } = makeCtx({
+      headers: [{ id: 'cw1', cwd: 'D:\\workspace', createdAt: 111, updatedAt: 222 }],
+      archived: [],
+      workspaces: [{ id: 'w1', path: 'D:\\workspace', sessionIds: ['cw1'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'cw1' });
+    const trash = await readTrashFile();
+    assert.equal(trash[0].cwd, 'D:\\workspace', 'cwd 必须来自 snapshot.header');
+    assert.equal(trash[0].createdAt, 111);
+    assert.equal(trash[0].updatedAt, 222);
+  });
+
+  it('删除后可成功恢复（cwd 非空才进得了恢复路径）', async () => {
+    const { handler, attachCalls } = makeCtx({
+      headers: [{ id: 'cw2', cwd: '/ws/proj', createdAt: 5, updatedAt: 6 }],
+      archived: [],
+      workspaces: [{ id: 'w2', path: '/ws/proj', sessionIds: [] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'cw2' });
+    const { body } = await callApi(handler, 'restore', { sessionId: 'cw2' });
+    assert.equal(body.ok, true, `应恢复成功，实际 error=${body.error}`);
+    assert.deepEqual(attachCalls, [['w2', 'cw2']]);
   });
 });
 
