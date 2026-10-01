@@ -434,6 +434,13 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
+  // The deleted tab is the only place a trashed session appears; every registry
+  // has forgotten it, so actions other than restore are meaningless there.
+  // Declared BEFORE reloadSessions: the render body below uses it, and a later
+  // declaration is a temporal-dead-zone ReferenceError that takes the whole
+  // plugin fiber down (the sidebar button silently vanishes, no error shown).
+  const inTrash = tab === 'deleted'
+
   const reloadSessions = (forTab: TabId) => {
     // The deleted tab reads the plugin's own trash, not the session store:
     // those sessions are still on disk but no longer accounted for anywhere.
@@ -709,9 +716,6 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   const hasSel = selected !== null
   const selArchived = selected?.archived === true
-  // The deleted tab is the only place a trashed session appears; every registry
-  // has forgotten it, so actions other than restore are meaningless there.
-  const inTrash = tab === 'deleted'
 
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
