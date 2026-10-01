@@ -9,15 +9,18 @@ import { apply } from '../lib/index.mjs';
  * @param opts.headers    persistence.list 返回的 header
  * @param opts.archivedIds 归档集
  * @param opts.groupedIds  有工作区归属的 id；缺省为「全部」（旧默认口径）
+ * @param opts.rawGroupedIds 记账里的原始 id（可与 header.id 格式不同）
  */
-function makeCtx({ headers, archivedIds, groupedIds }) {
+function makeCtx({ headers, archivedIds, groupedIds, rawGroupedIds }) {
   const persistence = {
     list: async () => headers,
     open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
   };
-  const ids = groupedIds ?? headers.map((h) => h.id);
+  const ids = rawGroupedIds ?? groupedIds ?? headers.map((h) => h.id);
   const registry = {
-    list: () => [{ sessionIds: ids }],
+    // record.sessionIds 是原始记账（DSH 实体里 record 为公开可读属性）；
+    // getter 形态这里刻意不给，模拟"getter 已被 cwd 过滤"的真实情况。
+    list: () => [{ record: { sessionIds: ids }, sessionIds: ids }],
     requireState: () => ({ archivedSessionIds: archivedIds }),
   };
   const services = { sessionPersistence: persistence, workspaceRegistry: registry };
@@ -141,6 +144,28 @@ describe('list-sessions 未分组（与 DSH 侧边栏「未分组」同口径）
     const u = await callListSessions(handler, { ungrouped: true });
     assert.equal(g.body.items.length, 0);
     assert.equal(u.body.items.length, 3);
+  });
+
+  // 实测：同一个工作区的记账里，81 条有 19 条带 `session-` 前缀、62 条是裸 UUID。
+  // DSH 的 `get sessionIds()` 用 sessionPaths.get(id) 查（key 是裸 UUID），
+  // 带前缀的查不到 → 被整条过滤。插件若用 getter，这些会话会被错算成"无归属"。
+  it('记账 id 带 session- 前缀时仍算有归属（不能错算进未分组）', async () => {
+    const handler = makeCtx({
+      headers: MIXED,
+      archivedIds: [],
+      rawGroupedIds: ['session-g1', 'g2'],
+    });
+    const g = await callListSessions(handler, {});
+    assert.deepEqual(g.body.items.map(i => i.sessionId).sort(), ['g1', 'g2'],
+      '前缀形式的记账项也必须让 g1 留在"有归属"页');
+    const u = await callListSessions(handler, { ungrouped: true });
+    assert.deepEqual(u.body.items.map(i => i.sessionId), ['u1']);
+  });
+
+  it('记账用裸 id、header 侧一致时行为不变', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: [], rawGroupedIds: ['g1', 'g2'] });
+    const g = await callListSessions(handler, {});
+    assert.deepEqual(g.body.items.map(i => i.sessionId).sort(), ['g1', 'g2']);
   });
 });
 

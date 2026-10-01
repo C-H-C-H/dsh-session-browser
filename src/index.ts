@@ -943,16 +943,24 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
     const archivedOnly = payload?.archived === true
     const archivedIds = readArchivedIds(ctx)
     const allHeaders = normalizeHeaders(await persistence.list())
-    // DSH 的 WorkspaceEntity.get sessionIds() 会过滤掉 cwd 与工作区 path
-    // 不一致的成员（entity.ts:102），所以这里拿到的 groupedIds 只含"真正
-    // 归属到某工作区"的会话。侧边栏的「未分组」= 全部 − 有归属的；两者口径
-    // 不同会让未归属的历史会话在插件里凭空消失，故显式支持 ungrouped 页签。
+    // DSH 的 WorkspaceEntity.get sessionIds()（entity.ts:102）会用
+    // `host.sessionPath(id) === record.path` 再过滤一遍，而 sessionPaths 的 key
+    // 是 header.id（裸 UUID）。实测记账里 id 格式并不统一——同一个工作区的 81 条
+    // 里有 19 条带 `session-` 前缀（entity.ts:652 之外的遗留写法），这些查不到
+    // 路径，会被 getter 整条丢弃。插件若直接用 getter，未分组页就会把"明明有
+    // 工作区归属"的会话错算成无归属。故改读原始 record.sessionIds，并对前缀做
+    // 双向兼容，两种格式都能匹配上 header.id。
     const registry = ctx.get('workspaceRegistry')
     const groupedIds = new Set<string>()
+    const addId = (raw: unknown) => {
+      if (typeof raw !== 'string' || raw === '') return
+      groupedIds.add(raw)
+      if (raw.startsWith('session-')) groupedIds.add(raw.slice('session-'.length))
+    }
     if (registry !== undefined && typeof registry.list === 'function') {
       for (const entity of registry.list()) {
-        const ids = typeof entity.sessionIds === 'function' ? entity.sessionIds() : entity.sessionIds
-        if (Array.isArray(ids)) for (const id of ids) groupedIds.add(id)
+        const ids = entity?.record?.sessionIds ?? (typeof entity?.sessionIds === 'function' ? entity.sessionIds() : entity?.sessionIds)
+        if (Array.isArray(ids)) for (const id of ids) addId(id)
       }
     }
     const headers = allHeaders.filter((h: any) => {
