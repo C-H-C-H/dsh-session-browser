@@ -35,6 +35,27 @@ function makeCtx({ headers, archivedIds, groupedIds, rawGroupedIds }) {
   return handler;
 }
 
+/** 构造「record 不可访问、只剩 getter 形态」的 registry，验证回退路径。 */
+function makeCtxNoRecord(headers, getterIds) {
+  const persistence = {
+    list: async () => headers,
+    open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
+  };
+  const registry = {
+    list: () => [{ sessionIds: getterIds }],   // 无 record 字段
+    requireState: () => ({ archivedSessionIds: [] }),
+  };
+  const services = { sessionPersistence: persistence, workspaceRegistry: registry };
+  let handler = null;
+  const ctx = {
+    get: (n) => services[n],
+    effect: (fn) => { fn(); return () => {}; },
+    webServer: { register: (r) => { handler = r.handler; } },
+  };
+  apply(ctx);
+  return handler;
+}
+
 async function callListSessions(handler, body) {
   const raw = Buffer.from(JSON.stringify(body));
   const req = {
@@ -166,6 +187,31 @@ describe('list-sessions 未分组（与 DSH 侧边栏「未分组」同口径）
     const handler = makeCtx({ headers: MIXED, archivedIds: [], rawGroupedIds: ['g1', 'g2'] });
     const g = await callListSessions(handler, {});
     assert.deepEqual(g.body.items.map(i => i.sessionId).sort(), ['g1', 'g2']);
+  });
+
+  it('record 不可访问时回退到 sessionIds 视图，且不丢前缀形式', async () => {
+    // 防御性：entity.record 是 TS private（编译后仍是普通属性），但若某天
+    // 改成 #private 或改名，插件必须还能工作 —— 至少不能比原来更少。
+    const handler = makeCtx({ headers: MIXED, archivedIds: [] });
+    // 覆盖成「无 record、只有 getter 形态」
+    const h2 = makeCtxNoRecord(MIXED, ['g1']);
+    const g = await callListSessions(h2, {});
+    assert.deepEqual(g.body.items.map(i => i.sessionId), ['g1'], '回退路径仍应按 getter 结果工作');
+    const u = await callListSessions(h2, { ungrouped: true });
+    assert.deepEqual(u.body.items.map(i => i.sessionId).sort(), ['g2', 'u1']);
+    void handler;
+  });
+});
+
+describe('宿主能力标记（STALE 自检）', () => {
+  // lib/index.mjs 由 DSH 主进程在启动时 import，改了不重启不生效。
+  // 症状不是报错，而是"两个页签内容一样"——与真 bug 无法区分。
+  // 故 list-sessions 必须回带 hostApi，客户端据此提示重启。
+  it('list-sessions 回带 hostApi 能力位', async () => {
+    const handler = makeCtx({ headers: [{ id: 'x1', cwd: '/w', createdAt: 1, updatedAt: 1 }], archivedIds: [] });
+    const { body } = await callListSessions(handler, {});
+    assert.equal(body.hostApi?.ungrouped, 1, '客户端靠这个判断宿主是否已重载');
+    assert.equal(body.hostApi?.trash, 1);
   });
 });
 

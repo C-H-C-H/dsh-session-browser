@@ -935,6 +935,17 @@ function readArchivedIds(ctx: Context): Set<string> {
   }
 }
 
+/**
+ * Host capability marker.
+ *
+ * `lib/index.mjs` is imported by the DSH MAIN process at startup, so editing it
+ * has NO effect until DSH fully restarts. The symptom is not an error — the
+ * client just gets answers from an older host (e.g. `ungrouped` silently ignored,
+ * so two tabs render identical lists), which is indistinguishable from a real bug.
+ * The client compares this against what it expects and prompts for a restart.
+ */
+export const HOST_API = { trash: 1, ungrouped: 1 } as const
+
 async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return { ok: false, error: 'sessionPersistence 服务不可用' }
@@ -959,8 +970,12 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
     }
     if (registry !== undefined && typeof registry.list === 'function') {
       for (const entity of registry.list()) {
-        const ids = entity?.record?.sessionIds ?? (typeof entity?.sessionIds === 'function' ? entity.sessionIds() : entity?.sessionIds)
-        if (Array.isArray(ids)) for (const id of ids) addId(id)
+        // 取并集而非二选一：record 是原始记账（含前缀形式），sessionIds 是被
+        // cwd 过滤过的视图。并集保证无论 record 是否可访问，都不会比原来更少。
+        const raw = entity?.record?.sessionIds
+        if (Array.isArray(raw)) for (const id of raw) addId(id)
+        const viaGetter = entity?.sessionIds
+        if (Array.isArray(viaGetter)) for (const id of viaGetter) addId(id)
       }
     }
     const headers = allHeaders.filter((h: any) => {
@@ -1001,7 +1016,7 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
       }
     })
     items.sort((a: any, b: any) => b.createdAt - a.createdAt)
-    return { ok: true, items }
+    return { ok: true, items, hostApi: HOST_API }
   } catch (err) {
     return { ok: false, error: String(err instanceof Error ? err.message : err) }
   }

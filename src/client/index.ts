@@ -460,6 +460,13 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       ungrouped: forTab === 'ungrouped',
     }).then((res: any) => {
       if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
+      // lib/index.mjs runs in the DSH MAIN process: editing it needs a full DSH
+      // restart. A stale host ignores `ungrouped` silently, so two tabs render
+      // identical lists — indistinguishable from a real bug. Say so explicitly.
+      if (res.hostApi?.ungrouped !== 1) {
+        setNotice('⚠ 插件宿主未重载（缺少未分组支持），请完全退出并重启 DSH')
+        setNoticeOk(false)
+      }
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
       let liveById: Record<string, any> = {}
