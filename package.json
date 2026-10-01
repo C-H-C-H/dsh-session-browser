@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-browser",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "DSH Desktop plugin for browsing sessions with round-level navigation and message jumping",
   "type": "module",
   "main": "lib/index.mjs",
@@ -22,7 +22,6 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-invariants": "^0.1.2-rc.1",
     "@deepseek-ai/cordis": "^4.0.2"
   },
   "keywords": [
