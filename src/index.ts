@@ -61,6 +61,13 @@ export interface TrashEntry {
   workspaceIds: string[]
   /** Header cwd — the target a restore re-attaches to. */
   cwd: string
+  /**
+   * Title snapshotted at delete time. A deleted session is detached from every
+   * store, so the sidebar's title is no longer reachable for it; without this
+   * snapshot the trash list falls back to the first user message. Absent on
+   * entries written before this field existed.
+   */
+  title?: string
   createdAt: number
   updatedAt: number
   deletedAt: number
@@ -100,6 +107,8 @@ function normalizeEntries(raw: unknown): TrashEntry[] {
       createdAt: typeof e.createdAt === 'number' ? e.createdAt : 0,
       updatedAt: typeof e.updatedAt === 'number' ? e.updatedAt : 0,
       deletedAt: typeof e.deletedAt === 'number' ? e.deletedAt : 0,
+      // 旧记录没有 title，保持 undefined 以便 list-deleted 回退到日志推导
+      ...(typeof e.title === 'string' ? { title: e.title } : {}),
     })
   }
   return out.slice(0, TRASH_MAX)
@@ -274,15 +283,15 @@ async function readEventsUntil(
 }
 
 /** Extract a display title from loaded events: renamed title, else first user message. */
-function titleFromEvents(events: any[]): string | undefined {
-  for (const event of events) {
-    if (event.type === 'session/title') {
-      const t = event.data?.title || event.data || ''
-      if (typeof t === 'string' && t.trim()) {
-        return t.trim().length > 40 ? t.trim().slice(0, 40) + '…' : t.trim()
-      }
-    }
-  }
+const TITLE_MAX = 40
+
+function truncateTitle(t: string): string {
+  const s = t.trim()
+  return s.length > TITLE_MAX ? s.slice(0, TITLE_MAX) + '…' : s
+}
+
+/** First user message, used when a session was never titled. */
+function firstUserMessage(events: any[]): string | undefined {
   for (const event of events) {
     if (event.type === 'user/message' && event.surfaceOp === 'append') {
       const data = event.data || {}
@@ -291,12 +300,45 @@ function titleFromEvents(events: any[]): string | undefined {
         : Array.isArray(data.content)
           ? data.content.map((c: any) => c.text || '').join('')
           : ''
-      if (content.trim()) {
-        return content.trim().length > 40 ? content.trim().slice(0, 40) + '…' : content.trim()
-      }
+      if (content.trim()) return truncateTitle(content)
     }
   }
   return undefined
+}
+
+/**
+ * Fast title probe: stops at the first usable value, so `readEventsUntil` can
+ * halt early (the list path reads one log per session and must stay cheap).
+ * It takes the FIRST `session/title`; a session renamed more than once can
+ * therefore report an older name here. Use {@link durableTitleFromEvents} where
+ * accuracy outranks speed.
+ */
+function titleFromEvents(events: any[]): string | undefined {
+  for (const event of events) {
+    if (event.type === 'session/title') {
+      const t = event.data?.title || event.data || ''
+      if (typeof t === 'string' && t.trim()) return truncateTitle(t)
+    }
+  }
+  return firstUserMessage(events)
+}
+
+/**
+ * Authoritative title, matching DSH's own fold (`foldSessionTitle`,
+ * session-title/src/index.ts:283 uses `findLast`): the LAST `session/title`
+ * wins, because each rename appends another event. Requires the whole log —
+ * `session/title` lands wherever the rename happened, so a bounded read can
+ * miss it entirely.
+ */
+function durableTitleFromEvents(events: any[]): string | undefined {
+  let found: string | undefined
+  for (const event of events) {
+    if (event.type !== 'session/title') continue
+    const t = event.data?.title
+    if (typeof t === 'string' && t.trim() !== '') found = t
+  }
+  if (found !== undefined) return truncateTitle(found)
+  return firstUserMessage(events)
 }
 
 /** Run `worker` over `items` with at most `limit` in flight. */
@@ -387,6 +429,7 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
       }
     }
     const persistence: any = ctx.get('sessionPersistence')
+    let title = ''
     if (typeof persistence?.stat === 'function') {
       // stat() returns a SessionPersistenceSnapshot `{ header, revision, … }`,
       // NOT the header itself (session-persistence/src/index.ts:50). Reading
@@ -400,11 +443,19 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
         updatedAt = typeof (header as any).updatedAt === 'number' ? (header as any).updatedAt : 0
       }
     }
+    // Snapshot the title while the session is still readable. Once delete
+    // detaches it, nothing can ask the sidebar/sessionTitle service about it
+    // any more, and the trash list would fall back to the first user message.
+    try {
+      const events = await readStoredEvents(persistence, sessionId)
+      title = durableTitleFromEvents(events ?? []) ?? ''
+    } catch { /* best-effort: trash still works, only the label degrades */ }
     trash = {
       sessionId,
       archived: readArchivedIds(ctx).has(sessionId),
       workspaceIds,
       cwd,
+      title,
       createdAt,
       updatedAt,
       deletedAt: Date.now(),
@@ -596,14 +647,10 @@ async function listDeleted(ctx: Context): Promise<Record<string, unknown>> {
     if (title === undefined) {
       title = ''
       try {
-        // Read the WHOLE log here, unlike the list-sessions path. `session/title`
-        // is appended when the user renames a conversation, so it sits near the
-        // END of the log — a readEventsUntil that stops at the first user/message
-        // (the fast path used for the live tabs) can never see it, and the trash
-        // list would show "你好" instead of the real name. Trashed sessions are
-        // few and cached, so the full read costs little.
+        // Fallback for entries written before the title snapshot existed
+        // (see TrashEntry.title). Whole log + last-wins fold, matching DSH.
         const events = await readStoredEvents(persistence, e.sessionId)
-        title = (events ? titleFromEvents(events) : undefined) || ''
+        title = (events ? durableTitleFromEvents(events) : undefined) || ''
       } catch { /* ignore */ }
       titleCache.set(key, title)
     }
@@ -614,7 +661,9 @@ async function listDeleted(ctx: Context): Promise<Record<string, unknown>> {
     result: {
       items: entries.map((e, i) => ({
         sessionId: e.sessionId,
-        title: titles[i] || shortPath(e.cwd) || '未命名',
+        title: (typeof e.title === 'string' && e.title !== '' ? e.title : titles[i])
+          || shortPath(e.cwd)
+          || '未命名',
         cwd: e.cwd,
         createdAt: e.createdAt,
         updatedAt: e.updatedAt,

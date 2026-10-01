@@ -412,6 +412,69 @@ describe('cwd 采集（stat 返回的是 snapshot 而非 header）', () => {
   });
 });
 
+describe('删除时快照标题（已删除会话无法再向侧边栏查询）', () => {
+  it('trash 条目记录删除时的会话名称', async () => {
+    const events = [
+      { type: 'session', seq: 0, data: {} },
+      { type: 'user/message', seq: 1, surfaceOp: 'append', data: { content: '你好' } },
+      { type: 'session/title', seq: 2, data: { title: '打招呼与问候开场' } },
+    ];
+    const { handler } = makeCtx({
+      headers: [{ id: 'ts-a', cwd: '/ws/ta', createdAt: 7001, updatedAt: 7001, events }],
+      archived: [],
+      workspaces: [{ id: 'wta', path: '/ws/ta', sessionIds: ['ts-a'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'ts-a' });
+    const trash = await readTrashFile();
+    assert.equal(trash[0].title, '打招呼与问候开场', '删除时应快照权威标题');
+    const { body } = await callApi(handler, 'list-deleted', {});
+    assert.equal(body.result.items[0].title, '打招呼与问候开场');
+  });
+
+  it('多次改名取最后一个（与 DSH findLast 语义一致）', async () => {
+    const events = [
+      { type: 'session', seq: 0, data: {} },
+      { type: 'user/message', seq: 1, surfaceOp: 'append', data: { content: '你好' } },
+      { type: 'session/title', seq: 2, data: { title: '旧名字' } },
+      { type: 'session/title', seq: 3, data: { title: '新名字' } },
+    ];
+    const { handler } = makeCtx({
+      headers: [{ id: 'ts-b', cwd: '/ws/tb', createdAt: 7102, updatedAt: 7102, events }],
+      archived: [],
+      workspaces: [{ id: 'wtb', path: '/ws/tb', sessionIds: ['ts-b'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'ts-b' });
+    const trash = await readTrashFile();
+    assert.equal(trash[0].title, '新名字', '以最后一次改名为准');
+  });
+
+  it('从未改名时快照回退到首条用户消息', async () => {
+    const events = [
+      { type: 'session', seq: 0, data: {} },
+      { type: 'user/message', seq: 1, surfaceOp: 'append', data: { content: '随手一问' } },
+    ];
+    const { handler } = makeCtx({
+      headers: [{ id: 'ts-c', cwd: '/ws/tc', createdAt: 7203, updatedAt: 7203, events }],
+      archived: [],
+      workspaces: [{ id: 'wtc', path: '/ws/tc', sessionIds: ['ts-c'] }],
+    });
+    await callApi(handler, 'delete', { sessionId: 'ts-c' });
+    const trash = await readTrashFile();
+    assert.equal(trash[0].title, '随手一问');
+  });
+
+  it('旧 trash 记录（无 title 字段）仍能正常显示', async () => {
+    await writeFile(trashFile, JSON.stringify([
+      { sessionId: 'old-1', archived: false, workspaceIds: [], cwd: '/ws/old', createdAt: 1, updatedAt: 1, deletedAt: 2 },
+    ]), 'utf8');
+    const { handler } = makeCtx();
+    const { body } = await callApi(handler, 'list-deleted', {});
+    assert.equal(body.ok, true);
+    assert.equal(body.result.items[0].sessionId, 'old-1');
+    assert.ok(body.result.items[0].title, '应回退到某个标题，不至于空白');
+  });
+});
+
 describe('trash 文件健壮性', () => {
   it('损坏的 JSON 读作空列表，不抛错', async () => {
     await writeFile(trashFile, '{ this is not json', 'utf8');
