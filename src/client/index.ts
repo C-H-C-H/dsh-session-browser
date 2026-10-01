@@ -530,7 +530,13 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     const wasCurrent = currentOpenSessionId(ctx) === sessionId
     const res: any = await callApi('move', { sessionId, targetWorkspaceId })
     if (!res?.ok) { setNotice(apiError(res, '移动会话失败')); setNoticeOk(false); return }
-    setNotice('移动成功'); setNoticeOk(true)
+    // Distinguish a real fork/move from a bookkeeping repair: with a stale
+    // "已属于目标工作区" message the user can't tell whether anything happened.
+    const r = res.result ?? {}
+    if (r.reattached) setNotice('已加入目标工作区（路径本就一致，此前缺少工作区记录）')
+    else if (r.alreadyInWorkspace) setNotice('会话已属于该工作区，无需移动')
+    else setNotice('移动成功（已在新工作区建立副本，原会话已归档）')
+    setNoticeOk(true)
     reloadSessions(tab)
     await refreshMovedSession(ctx, sessionId, wasCurrent)
     setTimeout(() => { refreshMovedSession(ctx, sessionId, wasCurrent) }, 250)

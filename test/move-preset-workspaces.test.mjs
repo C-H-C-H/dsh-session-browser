@@ -284,6 +284,41 @@ describe('move', () => {
     assert.equal(body.result.moved, false);
     assert.equal(body.result.message, '会话已属于目标工作区');
     assert.equal(created.length, 0, 'no-op 不应创建新会话');
+    assert.equal(body.result.alreadyInWorkspace, true);
+  });
+
+  // 实测回归：221 个会话 cwd == D:\workspace 却不在任何工作区记账里（派生会话）。
+  // 旧实现只看 cwd 就判 no-op 并返回 ok:true，UI 显示"移动成功"而什么都没发生。
+  it('move：cwd 与目标一致但记账里没有它 → 应补记账而不是 no-op', async () => {
+    const dst = await realDir('browser-t3-mv-orphan-');
+    const ent = makeEntity('w-dst', dst, []);   // 记账里没有 s-orphan
+    const { handler, created } = makeCtx({
+      entities: [ent],
+      observation: { header: { id: 's-orphan', cwd: dst }, events: [] },
+    });
+    const { body } = await callApi(handler, 'move', {
+      sessionId: 's-orphan', targetWorkspaceId: 'w-dst',
+    });
+    assert.equal(body.ok, true);
+    assert.equal(body.result.reattached, true, '缺记账时必须 attach，不能静默 no-op');
+    assert.equal(body.result.alreadyInWorkspace, undefined);
+    assert.ok(ent.record.sessionIds.includes('s-orphan'), '应真的 attach 进目标工作区');
+    assert.equal(created.length, 0, '路径一致时不需要 fork 新会话');
+  });
+
+  it('move：cwd 一致且已在记账中 → 不重复 attach', async () => {
+    const dst = await realDir('browser-t3-mv-has-');
+    const ent = makeEntity('w-dst', dst, ['s-here']);
+    const { handler } = makeCtx({
+      entities: [ent],
+      observation: { header: { id: 's-here', cwd: dst }, events: [] },
+    });
+    const { body } = await callApi(handler, 'move', {
+      sessionId: 's-here', targetWorkspaceId: 'w-dst',
+    });
+    assert.equal(body.result.alreadyInWorkspace, true);
+    assert.equal(body.result.reattached, undefined);
+    assert.equal(ent.record.sessionIds.filter(x => x === 's-here').length, 1, '已在记账中就不该重复 attach');
   });
 
   it('move 缺少 sessionId / targetWorkspaceId 返回 ok:false', async () => {

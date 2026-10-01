@@ -732,14 +732,41 @@ async function moveSession(ctx: Context, sessionId: string, targetWorkspaceId: s
     throw error
   }
 
-  // No-op when the source cwd already resolves to the target directory.
+  // The cwd already resolves to the target directory.
+  //
+  // Careful: cwd equality does NOT imply the session is booked there. Measured on
+  // a real profile: 221 sessions had cwd == D:\workspace yet appeared in NO
+  // workspace record (forked/derived sessions that were never attached). Judging
+  // by cwd alone made `move` return ok:true / moved:false without doing anything —
+  // the UI said "移动成功" while the session stayed exactly where it was. So the
+  // no-op must be confirmed against the accounting, and otherwise re-attached.
   if (typeof sourceHeader?.cwd === 'string') {
     let currentCanonical: string | undefined
     try {
       currentCanonical = await realpath(sourceHeader.cwd)
     } catch { /* old directory gone — the fork below re-homes it */ }
     if (currentCanonical === targetPath) {
-      return { ok: true, sessionId, moved: false, message: '会话已属于目标工作区' }
+      const rawTargetIds = Array.isArray(target.record?.sessionIds)
+        ? target.record.sessionIds
+        : (typeof target.sessionIds === 'function' ? target.sessionIds() : target.sessionIds)
+      const alreadyBooked = Array.isArray(rawTargetIds) && rawTargetIds.includes(sessionId)
+      if (alreadyBooked) {
+        return { ok: true, sessionId, moved: false, alreadyInWorkspace: true, toWorkspaceId: target.id, message: '会话已属于目标工作区' }
+      }
+      // Same cwd, missing bookkeeping: attach it. attachSession validates
+      // header.cwd against the workspace path, which holds by definition here.
+      await registry.enqueueOperation(async () => {
+        await target.attachSession(sessionId)
+      })
+      return {
+        ok: true,
+        sessionId,
+        moved: false,
+        reattached: true,
+        toWorkspaceId: target.id,
+        toWorkspaceTitle: target.title || target.id,
+        message: '已加入目标工作区（项目路径本就一致，此前缺少工作区记录）',
+      }
     }
   }
 
