@@ -96,6 +96,17 @@ function normalizeHeaders(entries: any): any[] {
 
 const READ_CHUNK = 500
 
+/**
+ * Title cache. Key = `${sessionId}@${updatedAt}` so any append (or a
+ * `session/title` rename, which bumps updatedAt) invalidates it automatically —
+ * no manual invalidation path, and two page tabs sharing a session hit the cache.
+ */
+const titleCache = new Map<string, string>()
+const TITLE_CACHE_MAX = 512
+
+/** Concurrency cap for persistence opens; IO-bound, so a small window suffices. */
+const TITLE_READ_CONCURRENCY = 8
+
 async function readStoredEvents(persistence: any, sessionId: string): Promise<any[] | undefined> {
   if (!persistence) return undefined
   // DSH >= 0.1.5: SessionHandle.read() returns { eventState, events } (SessionHandleReadResult).
@@ -116,6 +127,76 @@ async function readStoredEvents(persistence: any, sessionId: string): Promise<an
     }
   }
   return undefined
+}
+
+/**
+ * Read a session's events, stopping as soon as `pick` returns a value.
+ * Titles live at the head of the log (a `session/title` rename or the first user
+ * message), so a long conversation no longer costs a full multi-chunk read.
+ * Falls back to reading everything when the head does not yield a title.
+ */
+async function readEventsUntil(
+  persistence: any,
+  sessionId: string,
+  pick: (events: any[]) => string | undefined,
+): Promise<any[] | undefined> {
+  if (!persistence || typeof persistence.open !== 'function') return undefined
+  const handle = await persistence.open(sessionId, 'read')
+  try {
+    const events: any[] = []
+    for (let offset = 0; ; offset += READ_CHUNK) {
+      const result = await handle.read(offset, READ_CHUNK)
+      const slice = Array.isArray(result) ? result : result?.events
+      if (!slice || slice.length === 0) break
+      for (const ev of slice) events.push(ev)
+      const hit = pick(events)
+      if (hit !== undefined) return events
+    }
+    return events
+  } finally {
+    if (typeof handle.close === 'function') await handle.close()
+  }
+}
+
+/** Extract a display title from loaded events: renamed title, else first user message. */
+function titleFromEvents(events: any[]): string | undefined {
+  for (const event of events) {
+    if (event.type === 'session/title') {
+      const t = event.data?.title || event.data || ''
+      if (typeof t === 'string' && t.trim()) {
+        return t.trim().length > 40 ? t.trim().slice(0, 40) + '…' : t.trim()
+      }
+    }
+  }
+  for (const event of events) {
+    if (event.type === 'user/message' && event.surfaceOp === 'append') {
+      const data = event.data || {}
+      const content = typeof data.content === 'string'
+        ? data.content
+        : Array.isArray(data.content)
+          ? data.content.map((c: any) => c.text || '').join('')
+          : ''
+      if (content.trim()) {
+        return content.trim().length > 40 ? content.trim().slice(0, 40) + '…' : content.trim()
+      }
+    }
+  }
+  return undefined
+}
+
+/** Run `worker` over `items` with at most `limit` in flight. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length)
+  let next = 0
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = next++
+      if (index >= items.length) return
+      out[index] = await worker(items[index], index)
+    }
+  })
+  await Promise.all(runners)
+  return out
 }
 
 /** ------------------------------------------------------------------ route handlers */
@@ -178,9 +259,12 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
     try {
       agent.cancel({ kind: 'disposed' })
     } catch { /* best-effort */ }
-    // Quiesce the agent's own fiber via the registry face.
+    // Quiesce the agent's own fiber.
+    // NOTE: whenIdle() is an Agent INSTANCE method (dsh-agent runtime-types);
+    // it is NOT a method of the `agents` service. The old `liveAgents.whenIdle`
+    // guard therefore never passed and this quiesce silently never ran.
     try {
-      if (typeof liveAgents?.whenIdle === 'function') await liveAgents.whenIdle(sessionId)
+      if (typeof agent.whenIdle === 'function') await agent.whenIdle()
     } catch { /* best-effort */ }
   }
 
@@ -591,51 +675,34 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
       else if (archivedIds.has(h.id)) return false
       return true
     })
-    // Derive title from session/title event or first user message
-    const items: unknown[] = []
-    for (const h of headers) {
-      let title = ''
-      try {
-        const events = await readStoredEvents(persistence, h.id)
-        if (events) {
-          // First: look for session/title event (renamed title)
-          for (const event of events) {
-            if (event.type === 'session/title') {
-              const t = event.data?.title || event.data || ''
-              if (typeof t === 'string' && t.trim()) {
-                title = t.trim().length > 40 ? t.trim().slice(0, 40) + '…' : t.trim()
-                break
-              }
-            }
-          }
-          // Fallback: first user message
-          if (!title) {
-            for (const event of events) {
-              if (event.type === 'user/message' && event.surfaceOp === 'append') {
-                const data = event.data || {}
-                const content = typeof data.content === 'string'
-                  ? data.content
-                  : Array.isArray(data.content)
-                    ? data.content.map((c: any) => c.text || '').join('')
-                    : ''
-                if (content.trim()) {
-                  title = content.trim().length > 40 ? content.trim().slice(0, 40) + '…' : content.trim()
-                  break
-                }
-              }
-            }
-          }
+    // Derive title from session/title event or first user message.
+    // Parallel with a bounded window, cache-keyed on (id, updatedAt): a page-tab
+    // switch used to re-read every conversation's full event log serially, which
+    // is where the visible stall came from.
+    const items = await mapWithConcurrency(headers, TITLE_READ_CONCURRENCY, async (h: any) => {
+      const key = `${h.id}@${h.updatedAt ?? h.createdAt ?? ''}`
+      let title = titleCache.get(key)
+      if (title === undefined) {
+        title = ''
+        try {
+          const events = await readEventsUntil(persistence, h.id, titleFromEvents)
+          title = (events ? titleFromEvents(events) : undefined) || ''
+        } catch { /* ignore */ }
+        if (titleCache.size >= TITLE_CACHE_MAX) {
+          const oldest = titleCache.keys().next()
+          if (!oldest.done) titleCache.delete(oldest.value)
         }
-      } catch { /* ignore */ }
-      items.push({
+        titleCache.set(key, title)
+      }
+      return {
         sessionId: h.id,
         title: title || shortPath(h.cwd) || '未命名',
         cwd: h.cwd || '',
         createdAt: h.createdAt,
         updatedAt: h.updatedAt || h.createdAt,
         archived: archivedIds.has(h.id),
-      })
-    }
+      }
+    })
     items.sort((a: any, b: any) => b.createdAt - a.createdAt)
     return { ok: true, items }
   } catch (err) {

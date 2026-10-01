@@ -91,3 +91,112 @@ describe('list-sessions 归档分流', () => {
     );
   });
 });
+
+// 标题提取要为每个会话读事件日志，是切页签的主要耗时来源。
+// 这里守护三条性能行为：读次数有上限、并发有上限、相同 (id,updatedAt) 不重复读。
+describe('list-sessions 标题提取性能', () => {
+  function makeCountingCtx({ headers, events, archivedIds = [] }) {
+    const stats = { opens: 0, maxConcurrent: 0, concurrent: 0, readsById: {} };
+    const persistence = {
+      list: async () => headers,
+      open: async (id) => {
+        stats.opens += 1;
+        stats.concurrent += 1;
+        stats.maxConcurrent = Math.max(stats.maxConcurrent, stats.concurrent);
+        return {
+          read: async (offset) => {
+            stats.readsById[id] = (stats.readsById[id] || 0) + 1;
+            stats.concurrent -= 1;
+            // 每次 read 只给一小片，模拟分块读全量事件
+            const all = events[id] || [];
+            return { events: all.slice(offset, offset + 1) };
+          },
+          close: async () => {},
+        };
+      },
+    };
+    const allIds = headers.map((h) => h.id);
+    const registry = {
+      list: () => [{ sessionIds: allIds }],
+      requireState: () => ({ archivedSessionIds: archivedIds }),
+    };
+    const services = { sessionPersistence: persistence, workspaceRegistry: registry };
+    let handler = null;
+    const ctx = {
+      get: (name) => services[name],
+      effect: (fn) => { fn(); return () => {}; },
+      webServer: { register: (route) => { handler = route.handler; } },
+    };
+    apply(ctx);
+    return { handler, stats };
+  }
+
+  const MANY = Array.from({ length: 40 }, (_, i) => ({
+    id: `s${i}`, cwd: '/ws/proj', createdAt: 1000 + i, updatedAt: 1000 + i,
+  }));
+  // 每个会话 1200 条事件（跨越多个 500 分片），标题在第一条。
+  // 旧实现会读完所有分片；新实现读到能定标题即停。
+  const EVENTS = Object.fromEntries(MANY.map((h) => [h.id, [
+    { type: 'user/message', surfaceOp: 'append', data: { content: `标题 ${h.id}` } },
+    ...Array.from({ length: 1199 }, (_, k) => ({
+      type: 'assistant/message', surfaceOp: 'append', data: { content: `x${k}` },
+    })),
+  ]]));
+
+  it('长会话不应读满全量事件（读到能定标题即停）', async () => {
+    const { handler, stats } = makeCountingCtx({ headers: MANY, events: EVENTS });
+    const { body } = await callListSessions(handler, {});
+    assert.equal(body.items.length, 40);
+    assert.equal(body.items[0].title, '标题 s39');
+    // 每个会话最多读 2 片（首片命中标题），而非读完 1200 条事件
+    for (const h of MANY) {
+      assert.ok(stats.readsById[h.id] <= 2, `${h.id} 读了 ${stats.readsById[h.id]} 片，应 ≤2`);
+    }
+  });
+
+  it('并发读有上限（不得一次性打开全部句柄）', async () => {
+    // 用独立 id/updatedAt：titleCache 是模块级的，会跨用例存活，
+    // 复用 MANY 会全部命中缓存、一个句柄都不开。
+    const headers = Array.from({ length: 40 }, (_, i) => ({
+      id: `c${i}`, cwd: '/ws/proj', createdAt: 9000 + i, updatedAt: 9000 + i,
+    }));
+    const events = Object.fromEntries(headers.map((h) => [h.id, [
+      { type: 'user/message', surfaceOp: 'append', data: { content: `t ${h.id}` } },
+    ]]));
+    const { handler, stats } = makeCountingCtx({ headers, events });
+    await callListSessions(handler, {});
+    assert.ok(stats.maxConcurrent > 0, '应确实并发读以利用 IO 等待');
+    assert.ok(stats.maxConcurrent <= 8, `并发峰值 ${stats.maxConcurrent}，应 ≤8`);
+  });
+
+  it('同一 (id,updatedAt) 二次调用不重复打开句柄', async () => {
+    const headers = Array.from({ length: 12 }, (_, i) => ({
+      id: `k${i}`, cwd: '/ws/proj', createdAt: 7000 + i, updatedAt: 7000 + i,
+    }));
+    const events = Object.fromEntries(headers.map((h) => [h.id, [
+      { type: 'user/message', surfaceOp: 'append', data: { content: `t ${h.id}` } },
+    ]]));
+    const { handler, stats } = makeCountingCtx({ headers, events });
+    const first = await callListSessions(handler, {});
+    assert.equal(first.body.items.length, 12);
+    const firstOpens = stats.opens;
+    assert.ok(firstOpens > 0, '首次应真的读盘');
+    const { body } = await callListSessions(handler, {});
+    assert.equal(body.items.length, 12);
+    assert.equal(stats.opens, firstOpens, '标题缓存应命中，二次调用 opens 不应增加');
+  });
+
+  it('updatedAt 变化后缓存失效（改名能反映新标题）', async () => {
+    const headers = [{ id: 's1', cwd: '/ws/p', createdAt: 1, updatedAt: 100 }];
+    const handler = makeCtx({ headers, archivedIds: [] });
+    // 预热缓存（首读拿不到标题，回落到 cwd 派生标题）
+    await callListSessions(handler, {});
+    const renamed = [{ id: 's1', cwd: '/ws/p', createdAt: 1, updatedAt: 200 }];
+    const { handler: h2 } = makeCountingCtx({
+      headers: renamed,
+      events: { s1: [{ type: 'session/title', data: { title: '新名字' } }] },
+    });
+    const { body } = await callListSessions(h2, {});
+    assert.equal(body.items[0].title, '新名字', 'updatedAt 变化必须重新读事件');
+  });
+});

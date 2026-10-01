@@ -21,7 +21,7 @@ function makeStore(ids) {
   return store;
 }
 
-function makeCtx({ ids, archivedIds, live }) {
+function makeCtx({ ids, archivedIds, live, agentHasWhenIdle = true }) {
   const store = makeStore(ids);
   const deleted = new Set();
   const state = { archivedSessionIds: [...archivedIds] };
@@ -77,10 +77,16 @@ function makeCtx({ ids, archivedIds, live }) {
       },
     };
     services.agents = {
+      // whenIdle() 是 Agent 实例方法（dsh-agent runtime-types），不是 agents 服务方法。
+      // 挂到实例上才是真实形态；挂在服务上会掩盖"调用方写错接收者"这类缺陷。
       get: (sid) => (sid === live
-        ? { cancel: (opts) => { cancelCalls.push([sid, opts]); } }
+        ? {
+            cancel: (opts) => { cancelCalls.push([sid, opts]); },
+            ...(agentHasWhenIdle
+              ? { whenIdle: async () => { whenIdleCalls.push(sid); } }
+              : {}),
+          }
         : undefined),
-      whenIdle: async (sid) => { whenIdleCalls.push(sid); },
     };
   }
   const emits = [];
@@ -184,11 +190,22 @@ describe('delete', () => {
     const { body } = await callApi(handler, 'delete', { sessionId: 's-live' });
     assert.equal(body.ok, true);
     assert.deepEqual(cancelCalls, [['s-live', { kind: 'disposed' }]]);
-    assert.deepEqual(whenIdleCalls, ['s-live']);
+    assert.deepEqual(whenIdleCalls, ['s-live'], '必须在 Agent 实例上调 whenIdle');
     assert.equal(flushCalls.length, 1);
     assert.deepEqual(entryDetachCalls, ['s-live']);
     assert.equal(body.result?.deleted, true);
     assert.equal(body.result?.wasLive, true);
+    assert.equal(body.result?.detached, true);
+  });
+
+  it('delete 时 agent 实例也没有 whenIdle 仍应成功（防御性，不崩）', async () => {
+    const { handler, whenIdleCalls, entryDetachCalls } = makeCtx({
+      ids: ['s-live'], archivedIds: [], live: 's-live', agentHasWhenIdle: false,
+    });
+    const { body } = await callApi(handler, 'delete', { sessionId: 's-live' });
+    assert.equal(body.ok, true);
+    assert.deepEqual(whenIdleCalls, [], '实例没有该方法时不应调用');
+    assert.deepEqual(entryDetachCalls, ['s-live'], '仍应走完 detach 流程');
     assert.equal(body.result?.detached, true);
   });
 
