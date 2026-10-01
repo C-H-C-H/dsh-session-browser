@@ -8,6 +8,10 @@
  * - `/session-browser/api/archive` — `{ sessionId }` → `{ ok: true }`
  * - `/session-browser/api/unarchive` — `{ sessionId }` → `{ ok: true }`
  * - `/session-browser/api/delete` — `{ sessionId }` → `{ ok: true, result }`
+ *   (logical delete: records a trash entry first so a restore can put the
+ *   archive flag and workspace membership back)
+ * - `/session-browser/api/list-deleted` — `{}` → `{ ok: true, result: { items } }`
+ * - `/session-browser/api/restore` — `{ sessionId }` → `{ ok: true, result }`
  * - `/session-browser/api/move` — `{ sessionId, targetWorkspaceId }` → `{ ok: true, result }`
  * - `/session-browser/api/preset-migrate` — `{ sessionId, toPreset }` → `{ ok: true, result }`
  * - `/session-browser/api/workspaces` — `{}` → `{ ok: true, result: { workspaces } }`
@@ -15,6 +19,9 @@
 import type { Context } from 'cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { realpath } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rename, rm } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join, dirname } from 'node:path'
 
 /** Stable plugin name. */
 export const name = 'dsh-session-browser'
@@ -31,6 +38,112 @@ export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry', '
 /** ------------------------------------------------------------------ helpers */
 
 const MAX_BODY_BYTES = 1 << 20
+
+/**
+ * Trash metadata store.
+ *
+ * `delete` is a logical delete: the session leaves the live store, the
+ * workspace accounting and the archive set, but its event log stays on disk.
+ * That erases two facts a restore cannot re-derive — whether the session was
+ * archived, and which workspaces accounted for it — so record them here first.
+ *
+ * Storage is a single JSON file under `~/.dsh/`, deliberately NOT inside the
+ * session artifact tree: a trash record that dies with the session directory
+ * could never be used to restore it.
+ */
+export interface TrashEntry {
+  sessionId: string
+  /** Archive state at delete time; a restore must put it back exactly. */
+  archived: boolean
+  /** Workspaces that accounted for it at delete time, in order. */
+  workspaceIds: string[]
+  /** Header cwd — the target a restore re-attaches to. */
+  cwd: string
+  createdAt: number
+  updatedAt: number
+  deletedAt: number
+}
+
+const TRASH_MAX = 200
+
+/** Resolved lazily so tests can override before first use. */
+let trashPathOverride: string | undefined
+
+function trashPath(): string {
+  if (trashPathOverride !== undefined) return trashPathOverride
+  return join(homedir(), '.dsh', 'dsh-session-browser-trash.json')
+}
+
+/** Test seam: point the store at a temp file (or `undefined` to restore default). */
+export function __setTrashPath(path: string | undefined): void {
+  trashPathOverride = path
+}
+
+/** Drop entries whose id already appears, keeping the newest `list` order. */
+function normalizeEntries(raw: unknown): TrashEntry[] {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<string>()
+  const out: TrashEntry[] = []
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object') continue
+    const e = item as Record<string, unknown>
+    const sessionId = typeof e.sessionId === 'string' ? e.sessionId.trim() : ''
+    if (!sessionId || seen.has(sessionId)) continue
+    seen.add(sessionId)
+    out.push({
+      sessionId,
+      archived: e.archived === true,
+      workspaceIds: Array.isArray(e.workspaceIds) ? e.workspaceIds.filter((x): x is string => typeof x === 'string') : [],
+      cwd: typeof e.cwd === 'string' ? e.cwd : '',
+      createdAt: typeof e.createdAt === 'number' ? e.createdAt : 0,
+      updatedAt: typeof e.updatedAt === 'number' ? e.updatedAt : 0,
+      deletedAt: typeof e.deletedAt === 'number' ? e.deletedAt : 0,
+    })
+  }
+  return out.slice(0, TRASH_MAX)
+}
+
+/** Read the whole trash. A missing or corrupt file reads as empty, never throws. */
+export async function readTrash(): Promise<TrashEntry[]> {
+  try {
+    const text = await readFile(trashPath(), 'utf8')
+    return normalizeEntries(JSON.parse(text))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Persist the whole trash. Write-then-rename so a crash mid-write cannot leave
+ * a truncated file that would silently drop every record.
+ */
+export async function writeTrash(entries: TrashEntry[]): Promise<void> {
+  const path = trashPath()
+  await mkdir(dirname(path), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  await writeFile(tmp, JSON.stringify(normalizeEntries(entries), null, 2), 'utf8')
+  try {
+    await rename(tmp, path)
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => { /* best-effort */ })
+    throw err
+  }
+}
+
+/** Upsert one record, newest delete first, capped at TRASH_MAX. */
+export async function recordTrash(entry: TrashEntry): Promise<void> {
+  const rest = (await readTrash()).filter(e => e.sessionId !== entry.sessionId)
+  await writeTrash([entry, ...rest])
+}
+
+/** Remove one record. Returns whether it was present. */
+export async function dropTrash(sessionId: string): Promise<boolean> {
+  const all = await readTrash()
+  const next = all.filter(e => e.sessionId !== sessionId)
+  if (next.length === all.length) return false
+  await writeTrash(next)
+  return true
+}
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
@@ -254,6 +367,43 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
   const agent = liveAgents?.get?.(sessionId)
   const wasLive = session != null || agent != null
 
+  // Capture what the cleanup below is about to erase, so restore can put it back.
+  // Read BEFORE detaching: after this, both facts are gone for good.
+  let trash: TrashEntry | null = null
+  try {
+    const registry: any = ctx.get('workspaceRegistry')
+    const workspaceIds: string[] = []
+    let cwd = ''
+    let createdAt = 0
+    let updatedAt = 0
+    if (registry !== undefined && typeof registry.list === 'function') {
+      for (const entity of registry.list()) {
+        const ids = typeof entity.sessionIds === 'function' ? entity.sessionIds() : entity.sessionIds
+        if (Array.isArray(ids) && ids.includes(sessionId) && typeof entity.id === 'string') {
+          workspaceIds.push(entity.id)
+        }
+      }
+    }
+    const persistence: any = ctx.get('sessionPersistence')
+    if (typeof persistence?.stat === 'function') {
+      const header = await persistence.stat(sessionId)
+      if (header && typeof header === 'object') {
+        cwd = typeof (header as any).cwd === 'string' ? (header as any).cwd : ''
+        createdAt = typeof (header as any).createdAt === 'number' ? (header as any).createdAt : 0
+        updatedAt = typeof (header as any).updatedAt === 'number' ? (header as any).updatedAt : 0
+      }
+    }
+    trash = {
+      sessionId,
+      archived: readArchivedIds(ctx).has(sessionId),
+      workspaceIds,
+      cwd,
+      createdAt,
+      updatedAt,
+      deletedAt: Date.now(),
+    }
+  } catch { /* best-effort: a missing record only costs a less precise restore */ }
+
   if (agent != null) {
     // Stop any running turn (disposed-kind suppresses re-wake).
     try {
@@ -305,10 +455,20 @@ async function deleteSession(ctx: Context, sessionId: string): Promise<Record<st
     if (typeof persistence?.stat === 'function') await persistence.stat(sessionId)
   } catch { /* best-effort */ }
 
+  // Written last so a half-finished delete never leaves a restorable record.
+  let trashRecorded = false
+  if (trash !== null) {
+    try {
+      await recordTrash(trash)
+      trashRecorded = true
+    } catch { /* best-effort */ }
+  }
+
   return {
     deleted: true,
     wasLive,
     detached,
+    trashRecorded,
     artifactRemoved: false,
     note: '逻辑记录已清理；物理工件由后端持有，未做物理删除',
   }
@@ -318,6 +478,129 @@ function requireSessionId(payload: Record<string, unknown>): string {
   const sessionId = payload?.sessionId
   if (typeof sessionId !== 'string' || sessionId.trim() === '') throw new Error('sessionId 必填')
   return sessionId.trim()
+}
+
+/**
+ * Restore one logically deleted session.
+ *
+ * The re-attach target is the session's OWN cwd, never a synthetic container:
+ * `WorkspaceEntity.attachSession` validates `header.cwd` against the workspace
+ * path and `get sessionIds()` filters by that same match, so a session can only
+ * ever be accounted for by a workspace whose path IS its cwd.
+ *
+ * Original workspace ids are reused when they still exist; otherwise the cwd's
+ * workspace is created. A cwd that no longer resolves is reported rather than
+ * silently redirected — attaching it elsewhere would produce accounting DSH
+ * itself considers invalid.
+ */
+async function restoreSession(ctx: Context, sessionId: string): Promise<Record<string, unknown>> {
+  const entry = (await readTrash()).find(e => e.sessionId === sessionId)
+  if (entry === undefined) return { ok: false, error: 'not-in-trash' as const }
+
+  const registry: any = ctx.get('workspaceRegistry')
+  if (registry === undefined || typeof registry.list !== 'function') {
+    return { ok: false, error: 'workspaceRegistry 服务不可用' as const }
+  }
+
+  // The event log must still be there: everything below reads the header from it.
+  const persistence: any = ctx.get('sessionPersistence')
+  let header: any = undefined
+  try {
+    if (typeof persistence?.stat === 'function') header = await persistence.stat(sessionId)
+  } catch { /* handled below */ }
+  if (header === undefined) {
+    return { ok: false, error: 'artifacts-missing' as const, detail: '会话文件已不存在，无法恢复' }
+  }
+
+  const cwd = typeof entry.cwd === 'string' && entry.cwd !== '' ? entry.cwd : String(header.cwd ?? '')
+  if (cwd === '') return { ok: false, error: 'no-cwd' as const }
+
+  // Workspace the session used to belong to, if that entity is still around.
+  const entities = registry.list()
+  const original = entry.workspaceIds
+    .map(id => entities.find((e: any) => e?.id === id))
+    .filter((e: any): e is any => e !== undefined)
+
+  let attachedTo: string[] = []
+  const targets: any[] = original.length > 0
+    ? original
+    : [typeof registry.resolveByPath === 'function' ? await registry.resolveByPath(cwd) : undefined]
+        .filter((e: any): e is any => e !== undefined)
+
+  if (targets.length === 0) {
+    if (typeof registry.create !== 'function') return { ok: false, error: 'workspaceRegistry 服务不可用' as const }
+    const created = await registry.create(cwd)
+    if (created !== undefined) targets.push(created)
+  }
+
+  for (const entity of targets) {
+    try {
+      await entity.attachSession(sessionId)
+      attachedTo.push(typeof entity.id === 'string' ? entity.id : String(entity.path ?? ''))
+    } catch (err) {
+      return {
+        ok: false,
+        error: 'attach-failed' as const,
+        detail: String(err instanceof Error ? err.message : err),
+      }
+    }
+  }
+
+  if (attachedTo.length === 0) return { ok: false, error: 'attach-failed' as const }
+
+  // Put the archive state back exactly as it was before the delete.
+  if (entry.archived) {
+    try {
+      await archiveSession(ctx, sessionId)
+    } catch { /* best-effort: session is back, archive flag may lag */ }
+  }
+
+  await dropTrash(sessionId)
+
+  return {
+    ok: true,
+    result: {
+      restored: true,
+      sessionId,
+      archived: entry.archived === true,
+      workspaces: attachedTo,
+      cwd,
+    },
+  }
+}
+
+async function listDeleted(ctx: Context): Promise<Record<string, unknown>> {
+  const entries = await readTrash()
+  const persistence: any = ctx.get('sessionPersistence')
+  // Titles come from the same event head the session list uses; a restored-log
+  // read is bounded by readEventsUntil and cached by (id, updatedAt).
+  const titles = await mapWithConcurrency(entries, TITLE_READ_CONCURRENCY, async (e) => {
+    const key = `${e.sessionId}@${e.updatedAt || e.createdAt || ''}`
+    let title = titleCache.get(key)
+    if (title === undefined) {
+      title = ''
+      try {
+        const events = await readEventsUntil(persistence, e.sessionId, titleFromEvents)
+        title = (events ? titleFromEvents(events) : undefined) || ''
+      } catch { /* ignore */ }
+      titleCache.set(key, title)
+    }
+    return title
+  })
+  return {
+    ok: true,
+    result: {
+      items: entries.map((e, i) => ({
+        sessionId: e.sessionId,
+        title: titles[i] || shortPath(e.cwd) || '未命名',
+        cwd: e.cwd,
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt,
+        deletedAt: e.deletedAt,
+        archived: e.archived,
+      })),
+    },
+  }
 }
 
 async function handleArchive(ctx: Context, payload: Record<string, unknown>) {
@@ -795,6 +1078,16 @@ export function apply(ctx: Context) {
         }
         if (method === 'delete') {
           writeJson(res, 200, await handleDelete(ctx, payload))
+          return
+        }
+        if (method === 'list-deleted') {
+          writeJson(res, 200, await listDeleted(ctx))
+          return
+        }
+        if (method === 'restore') {
+          // Failure is reported in-band ({ ok:false, error }) so the client can
+          // show the precise reason (artifacts-missing / attach-failed / …).
+          writeJson(res, 200, await restoreSession(ctx, requireSessionId(payload)))
           return
         }
         if (method === 'move') {

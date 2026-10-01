@@ -15,7 +15,12 @@ interface SessionItem {
   createdAt: number
   updatedAt: number
   archived: boolean
+  /** Only on the deleted tab: when this logical delete happened. */
+  deletedAt?: number
 }
+
+/** Panel tabs: unarchived / archived / deleted (the plugin's own trash). */
+type TabId = 'active' | 'archived' | 'deleted'
 
 interface RoundItem {
   seq: number
@@ -415,7 +420,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
   const [selected, setSelected] = useState<SessionItem | null>(null)
   const [rounds, setRounds] = useState<RoundItem[]>([])
   const [filter, setFilter] = useState('')
-  const [tab, setTab] = useState<'active' | 'archived'>('active')
+  const [tab, setTab] = useState<TabId>('active')
   const [loading, setLoading] = useState(false)
   const [notice, setNotice] = useState('')
   const [noticeOk, setNoticeOk] = useState(false)
@@ -429,7 +434,16 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
-  const reloadSessions = (forTab: 'active' | 'archived') => {
+  const reloadSessions = (forTab: TabId) => {
+    // The deleted tab reads the plugin's own trash, not the session store:
+    // those sessions are still on disk but no longer accounted for anywhere.
+    if (forTab === 'deleted') {
+      callApi('list-deleted', {}).then((res: any) => {
+        if (!res?.ok) { setNotice(apiError(res, '加载回收站失败')); setNoticeOk(false); return }
+        setSessions((res.result?.items ?? []) as SessionItem[])
+      })
+      return
+    }
     callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
       if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
       const items = res.items || []
@@ -457,12 +471,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   useEffect(() => {
     if (!selected) { setRounds([]); setLoading(false); return }
+    // A trashed session shows metadata, not rounds: skip the read entirely.
+    if (tab === 'deleted') { setRounds([]); setLoading(false); return }
     setLoading(true)
     callApi('list-rounds', { sessionId: selected.sessionId }).then((res: any) => {
       setRounds(res.ok ? res.items : [])
       setLoading(false)
     })
-  }, [selected])
+  }, [selected, tab])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
@@ -480,7 +496,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     top: `${Math.max(8, Math.min((window.innerHeight - 960) / 2, window.innerHeight - 968))}px`,
   }
 
-  const switchTab = (next: 'active' | 'archived') => {
+  const switchTab = (next: TabId) => {
     setTab(next)
     setSelected(null)
     setRounds([])
@@ -527,6 +543,21 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
     if (wasCurrent) {
       try { await refreshSessionsStore(ctx) } catch { /* ignore */ }
     }
+    if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
+    reloadSessions(tab)
+  }
+
+  const onRestore = async (s: SessionItem): Promise<void> => {
+    setNotice(''); setNoticeOk(false)
+    const res: any = await callApi('restore', { sessionId: s.sessionId })
+    if (!res?.ok) {
+      // The host reports the precise reason (artifacts-missing / attach-failed
+      // / not-in-trash); surface it instead of a generic failure.
+      const detail = typeof res?.detail === 'string' && res.detail !== '' ? res.detail : apiError(res, '恢复失败')
+      setNotice(detail); setNoticeOk(false); return
+    }
+    setNotice(res.result?.archived ? '已恢复（回到已归档）' : '已恢复')
+    setNoticeOk(true)
     if (selected?.sessionId === s.sessionId) { setSelected(null); setRounds([]); setLoading(false) }
     reloadSessions(tab)
   }
@@ -656,7 +687,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       },
     }, label)
 
-  const tabBtn = (id: 'active' | 'archived', label: string) =>
+  const tabBtn = (id: TabId, label: string) =>
     createElement('button', {
       key: id,
       type: 'button',
@@ -678,6 +709,9 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
 
   const hasSel = selected !== null
   const selArchived = selected?.archived === true
+  // The deleted tab is the only place a trashed session appears; every registry
+  // has forgotten it, so actions other than restore are meaningless there.
+  const inTrash = tab === 'deleted'
 
   return createPortal(createElement('div', { key: 'ssb-root' },
     createElement('div', { key: 'backdrop', className: 'ssb_backdrop', onClick: onClose }),
@@ -688,9 +722,9 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           createElement('div', {
             key: 'tabs',
             role: 'tablist',
-            'aria-label': '归档筛选',
+            'aria-label': '会话分组',
             style: { display: 'inline-flex', gap: '2px', padding: '2px', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px' },
-          }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档')])
+          }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档'), tabBtn('deleted', '已删除')])
         ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
       ),
@@ -705,11 +739,14 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           flex: 'none',
         },
       },
-        toolBtn('归档', !hasSel || selArchived, () => { if (selected) void onArchive(selected) }),
-        toolBtn('移出归档', !hasSel || !selArchived, () => { if (selected) void onUnarchive(selected) }),
-        toolBtn('删除', !hasSel, () => { if (selected) void onRemove(selected) }),
-        toolBtn('移动', !hasSel, () => { if (selected) openMoveDialog(selected) }),
-        toolBtn('迁移', !hasSel, () => { if (selected) openMigrateDialog(selected) })
+        // Six actions, one row. The disabled matrix is tab-driven: a trashed
+        // session has left every registry, so only "恢复删除" applies to it.
+        toolBtn('归档', !hasSel || selArchived || inTrash, () => { if (selected) void onArchive(selected) }),
+        toolBtn('移出归档', !hasSel || !selArchived || inTrash, () => { if (selected) void onUnarchive(selected) }),
+        toolBtn('删除', !hasSel || inTrash, () => { if (selected) void onRemove(selected) }),
+        toolBtn('恢复删除', !hasSel || !inTrash, () => { if (selected) void onRestore(selected) }),
+        toolBtn('移动', !hasSel || inTrash, () => { if (selected) openMoveDialog(selected) }),
+        toolBtn('迁移', !hasSel || inTrash, () => { if (selected) openMigrateDialog(selected) })
       ),
       notice
         ? createElement('div', {
@@ -740,14 +777,20 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           }),
           createElement('div', { className: 'ssb_scroll' },
             filtered.length === 0
-              ? createElement('div', { className: 'ssb_empty' }, sessions.length === 0 ? '暂无会话' : '没有匹配的会话')
+              ? createElement('div', { className: 'ssb_empty' },
+                  sessions.length === 0
+                    ? (inTrash ? '回收站是空的' : '暂无会话')
+                    : '没有匹配的会话')
               : filtered.map(s =>
                   createElement('div', {
                     key: s.sessionId,
                     className: `ssb_sessionItem${selected?.sessionId === s.sessionId ? ' ssb_sessionItemActive' : ''}`,
                     onClick: () => {
                       setSelected(s)
-                      if (s.archived) return
+                      // Trashed sessions are detached from every registry: there
+                      // is nothing to expand or open, and the right column shows
+                      // its metadata instead of rounds.
+                      if (s.archived || inTrash) return
                       // Expand collapsed workspace group before opening
                       try {
                         if (s.cwd) {
@@ -782,34 +825,49 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
           onMouseDown: onColResizeStart,
           style: { width: '6px', flex: 'none', cursor: 'col-resize' },
         }),
-        // Right: round list
+        // Right: round list (deleted tab shows the trashed session's metadata)
         createElement('div', { key: 'rounds', className: 'ssb_roundList' },
           selected
             ? createElement('div', { className: 'ssb_roundTitle' }, selected.title || '(未命名)')
             : createElement('div', { className: 'ssb_roundTitle' }, '选择一个会话'),
-          selected?.archived
+          inTrash && selected
+            // A trashed session is off every registry, so "rounds" and
+            // "jump to message" do not apply; show what a restore needs instead.
+            ? createElement('div', { className: 'ssb_scroll' },
+                createElement('div', { className: 'ssb_status', style: { padding: '8px 12px' } },
+                  createElement('div', null, `项目目录：${selected.cwd || '(未知)'}`),
+                  createElement('div', null, `删除时间：${fmtTime(selected.deletedAt ?? selected.updatedAt) || '未知'}`),
+                  createElement('div', null, `删除前状态：${selected.archived ? '已归档' : '未归档'}`),
+                  createElement('div', { style: { marginTop: '6px', color: 'var(--dsw-alias-label-tertiary)' } },
+                    '会话文件仍保留在磁盘上，点「恢复删除」可放回原项目工作区。')
+                )
+              )
+            : null,
+          selected?.archived && !inTrash
             ? createElement('div', {
                 key: 'archivedNote',
                 style: { flex: 'none', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)', padding: '6px 12px 2px' },
               }, '已归档会话仅浏览，不跳转')
             : null,
-          createElement('div', { className: 'ssb_scroll' },
-            loading
-              ? createElement('div', { className: 'ssb_status' }, '加载中…')
-              : !selected
-                ? createElement('div', { className: 'ssb_empty' }, '← 点击左侧会话查看轮次')
-                : rounds.length === 0
-                  ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
-                  : rounds.map(r => {
-                      const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
-                      if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId, r.messageId, r.anchorKey)
-                      else itemProps.style = { cursor: 'default' }
-                      return createElement('div', itemProps,
-                        createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
-                        createElement('div', { className: 'ssb_roundMeta' }, fmtTime(r.time))
-                      )
-                    })
-          )
+          !inTrash
+            ? createElement('div', { className: 'ssb_scroll' },
+              loading
+                ? createElement('div', { className: 'ssb_status' }, '加载中…')
+                : !selected
+                  ? createElement('div', { className: 'ssb_empty' }, '← 点击左侧会话查看轮次')
+                  : rounds.length === 0
+                    ? createElement('div', { className: 'ssb_empty' }, '该会话无用户提问')
+                    : rounds.map(r => {
+                        const itemProps: any = { key: r.seq, className: 'ssb_roundItem' }
+                        if (!selected.archived) itemProps.onClick = () => jumpToMessage(ctx, selected.sessionId, r.seq, r.eventId, r.messageId, r.anchorKey)
+                        else itemProps.style = { cursor: 'default' }
+                        return createElement('div', itemProps,
+                          createElement('div', { className: 'ssb_roundContent' }, `Q${r.turnIndex + 1}: ${r.content}`),
+                          createElement('div', { className: 'ssb_roundMeta' }, fmtTime(r.time))
+                        )
+                      })
+              )
+            : null
         ),
         // Window resize handle (bottom-right corner)
         createElement('div', {
