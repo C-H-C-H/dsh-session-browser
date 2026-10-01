@@ -19,8 +19,8 @@ interface SessionItem {
   deletedAt?: number
 }
 
-/** Panel tabs: unarchived / archived / deleted (the plugin's own trash). */
-type TabId = 'active' | 'archived' | 'deleted'
+/** Panel tabs: grouped / ungrouped (DSH sidebar's「未分组」) / archived / deleted. */
+type TabId = 'active' | 'ungrouped' | 'archived' | 'deleted'
 
 interface RoundItem {
   seq: number
@@ -455,7 +455,10 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
       return
     }
     setSessions([])
-    callApi('list-sessions', { archived: forTab === 'archived' }).then((res: any) => {
+    callApi('list-sessions', {
+      archived: forTab === 'archived',
+      ungrouped: forTab === 'ungrouped',
+    }).then((res: any) => {
       if (!res.ok) { setNotice(apiError(res, '加载会话列表失败')); setNoticeOk(false); return }
       const items = res.items || []
       // Get live display titles from sessions store (same source as sidebar)
@@ -732,7 +735,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
             role: 'tablist',
             'aria-label': '会话分组',
             style: { display: 'inline-flex', gap: '2px', padding: '2px', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: '8px' },
-          }, [tabBtn('active', '未归档'), tabBtn('archived', '已归档'), tabBtn('deleted', '已删除')])
+          }, [tabBtn('active', '未归档'), tabBtn('ungrouped', '未分组'), tabBtn('archived', '已归档'), tabBtn('deleted', '已删除')])
         ),
         createElement('button', { className: 'ssb_closeBtn', onClick: onClose, title: '关闭' }, closeIcon())
       ),
@@ -787,7 +790,7 @@ function Panel({ onClose, ctx }: { onClose: () => void; ctx: Context }) {
             filtered.length === 0
               ? createElement('div', { className: 'ssb_empty' },
                   sessions.length === 0
-                    ? (inTrash ? '回收站是空的' : '暂无会话')
+                    ? (inTrash ? '回收站是空的' : tab === 'ungrouped' ? '没有未分组的会话' : '暂无会话')
                     : '没有匹配的会话')
               : filtered.map(s =>
                   createElement('div', {

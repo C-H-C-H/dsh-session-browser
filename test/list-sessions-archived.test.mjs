@@ -5,14 +5,19 @@ import { apply } from '../lib/index.mjs';
 // 通过 apply() 注册的 HTTP handler 测 list-sessions（src/index.ts 为 TS 源码，
 // lib/index.mjs 为手写镜像的可运行产物）。
 
-function makeCtx({ headers, archivedIds }) {
+/**
+ * @param opts.headers    persistence.list 返回的 header
+ * @param opts.archivedIds 归档集
+ * @param opts.groupedIds  有工作区归属的 id；缺省为「全部」（旧默认口径）
+ */
+function makeCtx({ headers, archivedIds, groupedIds }) {
   const persistence = {
     list: async () => headers,
     open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
   };
-  const allIds = headers.map((h) => h.id);
+  const ids = groupedIds ?? headers.map((h) => h.id);
   const registry = {
-    list: () => [{ sessionIds: allIds }],
+    list: () => [{ sessionIds: ids }],
     requireState: () => ({ archivedSessionIds: archivedIds }),
   };
   const services = { sessionPersistence: persistence, workspaceRegistry: registry };
@@ -89,6 +94,53 @@ describe('list-sessions 归档分流', () => {
       body.items.map((i) => i.sessionId),
       ['s-new', 's-mid', 's-old'],
     );
+  });
+});
+
+describe('list-sessions 未分组（与 DSH 侧边栏「未分组」同口径）', () => {
+  // DSH 的 WorkspaceEntity.get sessionIds() 会过滤掉 cwd 与工作区 path 不一致的
+  // 成员（entity.ts:102），因此「未归属工作区的历史会话」不在 allowedIds 里。
+  // 旧实现只显示 allowedIds 内的会话 → 这些会话在插件里凭空消失。
+  const MIXED = [
+    { id: 'g1', cwd: '/ws/proj', createdAt: 1000, updatedAt: 1000 },
+    { id: 'g2', cwd: '/ws/proj', createdAt: 2000, updatedAt: 2000 },
+    { id: 'u1', cwd: '/other/place', createdAt: 3000, updatedAt: 3000 },
+  ];
+
+  it('默认页只显示有工作区归属的会话', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: [], groupedIds: ['g1', 'g2'] });
+    const { body } = await callListSessions(handler, {});
+    assert.deepEqual(body.items.map(i => i.sessionId).sort(), ['g1', 'g2']);
+  });
+
+  it('ungrouped=true 只显示无工作区归属的会话（侧边栏「未分组」那一堆）', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: [], groupedIds: ['g1', 'g2'] });
+    const { body } = await callListSessions(handler, { ungrouped: true });
+    assert.deepEqual(body.items.map(i => i.sessionId), ['u1'],
+      '未归属的历史会话必须可见，否则用户在插件里找不到它');
+  });
+
+  it('两个页面互斥且合起来等于全部会话', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: [], groupedIds: ['g1'] });
+    const grouped = await callListSessions(handler, {});
+    const ungrouped = await callListSessions(handler, { ungrouped: true });
+    const all = [...grouped.body.items, ...ungrouped.body.items].map(i => i.sessionId).sort();
+    assert.deepEqual(all, ['g1', 'g2', 'u1'], '有归属 + 无归属 = 全部');
+  });
+
+  it('ungrouped 同样排除已归档会话', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: ['u1'], groupedIds: ['g1', 'g2'] });
+    const { body } = await callListSessions(handler, { ungrouped: true });
+    assert.deepEqual(body.items.map(i => i.sessionId), [],
+      '未分组页不应把已归档会话带出来');
+  });
+
+  it('全部会话都无归属时，默认页为空、未分组页为全部', async () => {
+    const handler = makeCtx({ headers: MIXED, archivedIds: [], groupedIds: [] });
+    const g = await callListSessions(handler, {});
+    const u = await callListSessions(handler, { ungrouped: true });
+    assert.equal(g.body.items.length, 0);
+    assert.equal(u.body.items.length, 3);
   });
 });
 

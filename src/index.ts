@@ -2,8 +2,10 @@
  * dsh-session-browser host half: HTTP routes for session browsing.
  *
  * - `/session-browser/api/list-sessions` — all stored session headers
- *   (`{ archived?: boolean }`: true → only archived, absent/false → only unarchived;
- *   every item carries `archived: boolean`; items sorted by `createdAt` desc)
+ *   (`{ archived?: boolean; ungrouped?: boolean }`: archived → only archived;
+ *   ungrouped → only sessions with no workspace membership (DSH's「未分组」);
+ *   neither → only sessions that DO belong to a workspace; every item carries
+ *   `archived: boolean`; items sorted by `createdAt` desc)
  * - `/session-browser/api/list-rounds` — user messages in a session
  * - `/session-browser/api/archive` — `{ sessionId }` → `{ ok: true }`
  * - `/session-browser/api/unarchive` — `{ sessionId }` → `{ ok: true }`
@@ -937,22 +939,26 @@ async function listSessions(ctx: Context, payload?: Record<string, unknown>) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined) return { ok: false, error: 'sessionPersistence 服务不可用' }
   try {
+    const ungroupedOnly = payload?.ungrouped === true
     const archivedOnly = payload?.archived === true
     const archivedIds = readArchivedIds(ctx)
     const allHeaders = normalizeHeaders(await persistence.list())
-    // Collect session IDs from all workspaces (current workspace scope)
+    // DSH 的 WorkspaceEntity.get sessionIds() 会过滤掉 cwd 与工作区 path
+    // 不一致的成员（entity.ts:102），所以这里拿到的 groupedIds 只含"真正
+    // 归属到某工作区"的会话。侧边栏的「未分组」= 全部 − 有归属的；两者口径
+    // 不同会让未归属的历史会话在插件里凭空消失，故显式支持 ungrouped 页签。
     const registry = ctx.get('workspaceRegistry')
-    let allowedIds: Set<string> | null = null
+    const groupedIds = new Set<string>()
     if (registry !== undefined && typeof registry.list === 'function') {
-      allowedIds = new Set()
       for (const entity of registry.list()) {
         const ids = typeof entity.sessionIds === 'function' ? entity.sessionIds() : entity.sessionIds
-        if (Array.isArray(ids)) for (const id of ids) allowedIds.add(id)
+        if (Array.isArray(ids)) for (const id of ids) groupedIds.add(id)
       }
     }
     const headers = allHeaders.filter((h: any) => {
       if (h.origin === 'subagent') return false
-      if (allowedIds !== null && !allowedIds.has(h.id)) return false
+      if (ungroupedOnly) { if (groupedIds.has(h.id)) return false }
+      else if (!groupedIds.has(h.id)) return false
       // 归档分流：已归档页只取交集，未归档页排除已归档 id
       if (archivedOnly) { if (!archivedIds.has(h.id)) return false }
       else if (archivedIds.has(h.id)) return false
