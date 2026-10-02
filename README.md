@@ -1,5 +1,7 @@
 # dsh-session-browser
 
+> **DSH Desktop 插件** · 适配 DSH Desktop `0.2.0-rc.2` · 需要 [`@deepseek-ai/cordis`](https://github.com/deepseek-ai/deepseek-harness) `^4.0.2`
+
 **DSH Desktop 插件** —— 会话浏览器，支持轮次级导航、消息跳转与可恢复的删除（回收站）。
 
 适配 **DSH Desktop 0.2.0-rc.2**（源码 tag `dsh-v0.2.0-rc.2`）。
